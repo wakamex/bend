@@ -3972,6 +3972,7 @@ static const char* ERR_TEXT[] = { ${ERRS.map((s) => JSON.stringify(s))
 static void err_fail(const char* msg) {
   fflush(stdout);
   fprintf(stderr, "bend: %s\n", msg);
+  fflush(stderr);  // _exit drops buffers, and Windows buffers stderr into a pipe
   _exit(1);
 }
 
