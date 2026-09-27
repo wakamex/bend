@@ -411,8 +411,9 @@ function cc_find(gpu: boolean): string {
 
 // cli_build builds the C file at `file` into the binary `bin`. A `!` program
 // builds with the GPU lane and writes its GPU program too (on Linux only with
-// CUDA at $CUDA_HOME, else at /usr/local/cuda, its libraries in lib64 or, as
-// nix lays them, lib; else the ! runs on the cores). On macOS a program with
+// CUDA at $CUDA_HOME, else at /usr/local/cuda, whose NVRTC makes it; else the
+// ! runs on the cores). The binary loads the driver and NVRTC when it runs,
+// so the build itself needs neither. On macOS a program with
 // a framework (#import: a window, audio) builds as Objective-C; on Linux it
 // links the X11 and ALSA libraries it includes.
 function cli_build(bin: string, file: string): void {
@@ -429,8 +430,7 @@ function cli_build(bin: string, file: string): void {
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
     ...libs, "-o", path.resolve(bin)];
   const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
-    : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
-      "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
+    : ["-DBEND_CUDA=1", ...cpu, "-ldl"];
   const steps: [string, string[]][] = bangs
     ? [[cc, gpu], [path.resolve(bin), ["--gpu-build"]]] : [[cc, cpu]];
   for (const [cmd, args] of steps) {

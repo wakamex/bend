@@ -2915,9 +2915,9 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     `(V)[${j}] = ${r};`).join(" ")}`, "",
   `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
     `${r} = (V)[${j}];`).join(" ")}`, "",
-  `#define WL_SIG Env e, DEV Term* sp, u32 seq, u32 rn, ${ws.map((w) =>
-    "Term " + w).join(", ")}`, "", `#define WL_ALL e, sp, seq, rn, ${ws
-    .join(", ")}`, "",
+  `#define WL_SIG u64* wl_mem, u64* wl_alc, DEV Term* sp, u32 seq, u32 rn, ${
+    ws.map((w) => "Term " + w).join(", ")}`, "",
+  `#define WL_ALL e.mem, e.alc, sp, seq, rn, ${ws.join(", ")}`, "",
   `#define WL_TABLE ${entries.map((s) => `WL_X(${s.fid})`).join(" ")}`
     + " WL_X(FID_EXIT)");
   return defs;
@@ -3392,12 +3392,19 @@ using namespace metal;
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define POLLIN  1
+#define POLLOUT 4
+#else
 #include <unistd.h>
 #include <signal.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <poll.h>
 #include <sys/select.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -3405,10 +3412,173 @@ using namespace metal;
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
 #elif BEND_CUDA
-#include <cuda.h>
-#include <nvrtc.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+// The driver and NVRTC are loaded when first needed, not linked, so a binary
+// starts on a machine without them and runs its bangs on the CPU, and building
+// one needs no CUDA toolkit: the host declares the few calls it makes (as
+// cuda.h 13 and nvrtc.h do), and each entry of the tables below pairs a name
+// with the symbol the libraries export for it.
+
+#ifdef _WIN32
+#define CUDAAPI __stdcall
+#else
+#define CUDAAPI
+#endif
+#define CUDA_VERSION 13000
+#define CUDA_SUCCESS 0
+#define NVRTC_SUCCESS 0
+#define CU_MEM_ATTACH_GLOBAL 1
+#define CU_MEM_ADVISE_SET_PREFERRED_LOCATION 3
+#define CU_MEM_LOCATION_TYPE_DEVICE 1
+
+typedef int                 CUresult;
+typedef int                 CUdevice;
+typedef unsigned long long  CUdeviceptr;
+typedef struct CUctx_st*    CUcontext;
+typedef struct CUmod_st*    CUmodule;
+typedef struct CUfunc_st*   CUfunction;
+typedef struct CUstream_st* CUstream;
+typedef int                 CUmem_advise;
+typedef struct { int type; int id; } CUmemLocation;
+typedef enum {
+  CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE = 38,
+  CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75,
+  CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76,
+  CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY = 83,
+  CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS = 89
+} CUdevice_attribute;
+typedef int                   nvrtcResult;
+typedef struct _nvrtcProgram* nvrtcProgram;
+
+CUresult CUDAAPI cuInit(unsigned int flags);
+CUresult CUDAAPI cuDeviceGet(CUdevice* dev, int ordinal);
+CUresult CUDAAPI cuDeviceGetAttribute(int* v, CUdevice_attribute a, CUdevice dev);
+CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext* ctx, CUdevice dev);
+CUresult CUDAAPI cuCtxSetCurrent(CUcontext ctx);
+CUresult CUDAAPI cuCtxSynchronize(void);
+CUresult CUDAAPI cuMemAllocManaged(CUdeviceptr* p, size_t bytes, unsigned int flags);
+CUresult CUDAAPI cuMemAdvise(CUdeviceptr p, size_t bytes, CUmem_advise advice,
+  CUmemLocation at);
+CUresult CUDAAPI cuMemsetD8(CUdeviceptr p, unsigned char v, size_t n);
+CUresult CUDAAPI cuDeviceTotalMem(size_t* bytes, CUdevice dev);
+CUresult CUDAAPI cuModuleLoadData(CUmodule* m, const void* image);
+CUresult CUDAAPI cuModuleGetFunction(CUfunction* f, CUmodule m, const char* name);
+CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy,
+  unsigned int gz, unsigned int bx, unsigned int by, unsigned int bz,
+  unsigned int shared, CUstream stream, void** params, void** extra);
+CUresult CUDAAPI cuMemAlloc(CUdeviceptr* p, size_t bytes);
+CUresult CUDAAPI cuMemcpyDtoH(void* dst, CUdeviceptr src, size_t bytes);
+CUresult CUDAAPI cuMemFree(CUdeviceptr p);
+nvrtcResult nvrtcCreateProgram(nvrtcProgram* p, const char* src, const char* name,
+  int nh, const char* const* headers, const char* const* names);
+nvrtcResult nvrtcCompileProgram(nvrtcProgram p, int n, const char* const* opts);
+nvrtcResult nvrtcGetProgramLogSize(nvrtcProgram p, size_t* n);
+nvrtcResult nvrtcGetProgramLog(nvrtcProgram p, char* log);
+nvrtcResult nvrtcGetCUBINSize(nvrtcProgram p, size_t* n);
+nvrtcResult nvrtcGetCUBIN(nvrtcProgram p, char* bin);
+nvrtcResult nvrtcDestroyProgram(nvrtcProgram* p);
+
+#define GPU_CU_FNS(X) \
+  X(cuInit, cuInit) X(cuDeviceGet, cuDeviceGet) \
+  X(cuDeviceGetAttribute, cuDeviceGetAttribute) \
+  X(cuDevicePrimaryCtxRetain, cuDevicePrimaryCtxRetain) \
+  X(cuCtxSetCurrent, cuCtxSetCurrent) X(cuCtxSynchronize, cuCtxSynchronize) \
+  X(cuMemAllocManaged, cuMemAllocManaged) X(cuMemAdvise, cuMemAdvise_v2) \
+  X(cuMemsetD8, cuMemsetD8_v2) X(cuDeviceTotalMem, cuDeviceTotalMem_v2) \
+  X(cuModuleLoadData, cuModuleLoadData) \
+  X(cuModuleGetFunction, cuModuleGetFunction) \
+  X(cuLaunchKernel, cuLaunchKernel) X(cuMemAlloc, cuMemAlloc_v2) \
+  X(cuMemcpyDtoH, cuMemcpyDtoH_v2) X(cuMemFree, cuMemFree_v2)
+
+#define GPU_RTC_FNS(X) \
+  X(nvrtcCreateProgram, nvrtcCreateProgram) \
+  X(nvrtcCompileProgram, nvrtcCompileProgram) \
+  X(nvrtcGetProgramLogSize, nvrtcGetProgramLogSize) \
+  X(nvrtcGetProgramLog, nvrtcGetProgramLog) \
+  X(nvrtcGetCUBINSize, nvrtcGetCUBINSize) X(nvrtcGetCUBIN, nvrtcGetCUBIN) \
+  X(nvrtcDestroyProgram, nvrtcDestroyProgram)
+
+#define GPU_FN_PTR(api, sym) static __typeof__(api)* gpu_fn_##api;
+GPU_CU_FNS(GPU_FN_PTR)
+GPU_RTC_FNS(GPU_FN_PTR)
+
+#define cuInit                   (*gpu_fn_cuInit)
+#define cuDeviceGet              (*gpu_fn_cuDeviceGet)
+#define cuDeviceGetAttribute     (*gpu_fn_cuDeviceGetAttribute)
+#define cuDevicePrimaryCtxRetain (*gpu_fn_cuDevicePrimaryCtxRetain)
+#define cuCtxSetCurrent          (*gpu_fn_cuCtxSetCurrent)
+#define cuCtxSynchronize         (*gpu_fn_cuCtxSynchronize)
+#define cuMemAllocManaged        (*gpu_fn_cuMemAllocManaged)
+#define cuMemAdvise              (*gpu_fn_cuMemAdvise)
+#define cuMemsetD8               (*gpu_fn_cuMemsetD8)
+#define cuDeviceTotalMem         (*gpu_fn_cuDeviceTotalMem)
+#define cuModuleLoadData         (*gpu_fn_cuModuleLoadData)
+#define cuModuleGetFunction      (*gpu_fn_cuModuleGetFunction)
+#define cuLaunchKernel           (*gpu_fn_cuLaunchKernel)
+#define cuMemAlloc               (*gpu_fn_cuMemAlloc)
+#define cuMemcpyDtoH             (*gpu_fn_cuMemcpyDtoH)
+#define cuMemFree                (*gpu_fn_cuMemFree)
+#define nvrtcCreateProgram       (*gpu_fn_nvrtcCreateProgram)
+#define nvrtcCompileProgram      (*gpu_fn_nvrtcCompileProgram)
+#define nvrtcGetProgramLogSize   (*gpu_fn_nvrtcGetProgramLogSize)
+#define nvrtcGetProgramLog       (*gpu_fn_nvrtcGetProgramLog)
+#define nvrtcGetCUBINSize        (*gpu_fn_nvrtcGetCUBINSize)
+#define nvrtcGetCUBIN            (*gpu_fn_nvrtcGetCUBIN)
+#define nvrtcDestroyProgram      (*gpu_fn_nvrtcDestroyProgram)
+
+static void* gpu_sym(void* lib, const char* name) {
+#ifdef _WIN32
+  return lib == NULL ? NULL : (void*)GetProcAddress((HMODULE)lib, name);
+#else
+  return lib == NULL ? NULL : dlsym(lib, name);
+#endif
+}
+
+// The first library of the list that opens, or NULL.
+static void* gpu_lib_open(const char* const* names) {
+  for (; *names != NULL; names += 1) {
+#ifdef _WIN32
+    void* lib = (void*)LoadLibraryA(*names);
+#else
+    void* lib = dlopen(*names, RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (lib != NULL) {
+      return lib;
+    }
+  }
+  return NULL;
+}
+
+static bool gpu_open_cu(void) {
+#ifdef _WIN32
+  static const char* const names[] = { "nvcuda.dll", NULL };
+#else
+  static const char* const names[] = { "libcuda.so.1", "libcuda.so", NULL };
+#endif
+  void* lib = gpu_lib_open(names);
+  bool  ok  = lib != NULL;
+#define GPU_FN_LOAD(api, sym) \
+  ok = ok && (gpu_fn_##api = (__typeof__(gpu_fn_##api))gpu_sym(lib, #sym));
+  GPU_CU_FNS(GPU_FN_LOAD)
+  return ok;
+}
+
+static bool gpu_open_rtc(void) {
+#ifdef _WIN32
+  static const char* const names[] = { "nvrtc64_130_0.dll", "nvrtc64_120_0.dll",
+    NULL };
+#else
+  static const char* const names[] = { "libnvrtc.so", "libnvrtc.so.13",
+    "libnvrtc.so.12", NULL };
+#endif
+  void* lib = gpu_lib_open(names);
+  bool  ok  = lib != NULL;
+  GPU_RTC_FNS(GPU_FN_LOAD)
+  return ok;
+}
 #endif
 #endif
 
@@ -3420,7 +3590,9 @@ using namespace metal;
 // in L1: lanes hand off through a32 and FENCE. Only clang 19+ has both
 // preserve_none and preserve_most, and compiles preserve_most soundly. A
 // segment is a case of the device's switch; on the host, a preserve_none
-// function (WL_SIG) entered by musttail, its words fresh at WL_OPEN.
+// function (WL_SIG) entered by musttail, its words fresh at WL_OPEN. The Env
+// crosses as its two pointers: Windows x64 passes a 16-byte struct through a
+// pointer to a copy, which a musttail call leaves dangling.
 
 #ifdef __METAL_VERSION__
 #if __METAL_VERSION__ >= 320
@@ -3465,6 +3637,7 @@ using namespace metal;
 #define FENCE() ((void)0)
 #endif
 #endif
+#undef FAR  // windows.h has its own
 #define FAR static __attribute__((noinline))
 
 #if DEVICE
@@ -3479,7 +3652,7 @@ using namespace metal;
 #define UNLOCK(l)  __atomic_store_n(&(l), 0, __ATOMIC_RELEASE)
 #define WL_FN      static PRESERVE(preserve_none) __attribute__((noinline)) Term
 #define WL_CASE(F) WL_FN WL_##F(WL_SIG)
-#define WL_OPEN    { WL_BANK u32 rn;
+#define WL_OPEN    { Env e = { wl_mem, wl_alc }; WL_BANK u32 rn;
 #define WL_JMP(F)  __attribute__((musttail)) return WL_##F(WL_ALL)
 #define WL_DYN(F)  __attribute__((musttail)) return wl_tab[F](WL_ALL)
 #endif
@@ -4781,10 +4954,89 @@ static void row_grow(Env e, DEV Term* stk, u32 base, u32 stride, u32 want) {
 
 // cpu_count caps the CPU count by the affinity mask and the cgroup quota.
 
+#ifdef _WIN32
+
+// Windows has no lazily backed mapping (MAP_NORESERVE). A span is reserved,
+// and its pages are committed the first time they are touched, 64 KiB at a
+// time, by a vectored exception handler. A stack's guard is never committed:
+// a touch there is ERR_DEEP. Faults outside the spans go on to the host.
+
+#define MAP_FAILED ((void*)-1)
+
+typedef struct { char* lo; char* hi; char* guard; } PoolSpan;
+
+static PoolSpan    pool_spans[1024];
+static _Atomic u32 pool_nspans;
+static SRWLOCK     pool_span_lock = SRWLOCK_INIT;
+
+static LONG CALLBACK pool_fault(EXCEPTION_POINTERS* x) {
+  if (x->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  char* at = (char*)x->ExceptionRecord->ExceptionInformation[1];
+  u32   n  = atomic_load_explicit(&pool_nspans, memory_order_acquire);
+  for (u32 i = 0; i < n; i += 1) {
+    PoolSpan s = pool_spans[i];
+    if (at < s.lo || at >= s.hi) {
+      continue;
+    }
+    if (s.guard != NULL && at >= s.guard) {
+      err_post(NULL, ERR_DEEP);
+    }
+    char* end = s.guard != NULL ? s.guard : s.hi;
+    char* lo  = (char*)((uintptr_t)at & ~(uintptr_t)0xFFFF);
+    lo = lo < s.lo ? s.lo : lo;
+    char* hi  = lo + 0x10000 < end ? lo + 0x10000 : end;
+    return VirtualAlloc(lo, (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)
+      != NULL ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void* pool_try(void* at, u64 bytes) {
+  static _Atomic int armed;
+  if (atomic_exchange(&armed, 1) == 0) {
+    AddVectoredExceptionHandler(1, pool_fault);
+  }
+  char* p = VirtualAlloc(at, (SIZE_T)bytes, MEM_RESERVE, PAGE_READWRITE);
+  if (p == NULL) {
+    return MAP_FAILED;
+  }
+  AcquireSRWLockExclusive(&pool_span_lock);
+  u32 n = atomic_load(&pool_nspans);
+  if (n == sizeof pool_spans / sizeof *pool_spans) {
+    err_fail("too many reservations");
+  }
+  pool_spans[n] = (PoolSpan){ p, p + bytes, NULL };
+  atomic_store_explicit(&pool_nspans, n + 1, memory_order_release);
+  ReleaseSRWLockExclusive(&pool_span_lock);
+  return p;
+}
+
+// A span is never reused, so a fault can read the table without a lock.
+static void pool_free(void* p, u64 bytes) {
+  AcquireSRWLockExclusive(&pool_span_lock);
+  for (u32 i = 0; i < atomic_load(&pool_nspans); i += 1) {
+    if (pool_spans[i].lo == p) {
+      pool_spans[i].hi = pool_spans[i].lo;
+    }
+  }
+  ReleaseSRWLockExclusive(&pool_span_lock);
+  VirtualFree(p, 0, MEM_RELEASE);
+}
+
+#else
+
 static void* pool_try(void* at, u64 bytes) {
   return mmap(at, bytes, PROT_READ | PROT_WRITE,
     MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
 }
+
+static void pool_free(void* p, u64 bytes) {
+  munmap(p, bytes);
+}
+
+#endif
 
 static void* pool_mmap(u64 bytes) {
   void* p = pool_try(NULL, bytes);
@@ -4793,6 +5045,23 @@ static void* pool_mmap(u64 bytes) {
   }
   return p;
 }
+
+#ifdef _WIN32
+
+static Term* pool_stack(void) {
+  u64   len = 1ull << 31;
+  char* p   = pool_mmap(len + 16384);
+  AcquireSRWLockExclusive(&pool_span_lock);
+  for (u32 i = 0; i < atomic_load(&pool_nspans); i += 1) {
+    if (pool_spans[i].lo == p) {
+      pool_spans[i].guard = p + len;
+    }
+  }
+  ReleaseSRWLockExclusive(&pool_span_lock);
+  return (Term*)p;
+}
+
+#else
 
 static Term* pool_stack(void) {
   u64   len = 1ull << 31;
@@ -4807,6 +5076,8 @@ static Term* pool_stack(void) {
   sigaction(SIGBUS, &sa, NULL);
   return (Term*)p;
 }
+
+#endif
 
 static void* pool_work(void* arg) {
   Term* stk  = pool_stack();
@@ -4869,7 +5140,11 @@ static int cpu_read(const char* path, long* a, long* b) {
 }
 
 static long cpu_count(void) {
+#ifdef _WIN32
+  long n = (long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#else
   long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 #ifdef __linux__
   cpu_set_t set;
   if (sched_getaffinity(0, sizeof set, &set) == 0) {
@@ -4916,6 +5191,8 @@ static const char* gpu_path(void) {
   u32 n = sizeof path - 8;
 #ifdef __APPLE__
   _NSGetExecutablePath(path, &n);
+#elif defined(_WIN32)
+  path[GetModuleFileNameA(NULL, path, n)] = 0;
 #else
   path[readlink("/proc/self/exe", path, n)] = 0;
 #endif
@@ -5076,20 +5353,52 @@ static void gpu_shape(int units) {
   CUBE_LOG = 31 - CLZ(units < 16 ? 16 : units > 128 ? 128 : units);
 }
 
+// A GPU program to run: the sidecar made for this source and device, or NVRTC
+// to make one. Without either the bangs run on the CPU (with a note) rather
+// than stopping at the first launch.
+static bool gpu_ready(void) {
+  FILE* in  = fopen(gpu_path(), "rb");
+  u64   key = 0;
+  bool  ok  = in != NULL && fread(&key, 8, 1, in) == 1 && key == gpu_hash();
+  if (in != NULL) {
+    fclose(in);
+  }
+  if (!ok && !gpu_open_rtc()) {
+    fprintf(stderr, "bend: no GPU program for this device (%s) and no NVRTC to"
+      " make one; running on the CPU\n", gpu_path());
+    return false;
+  }
+  return true;
+}
+
 static bool gpu_probe(void) {
   int       managed = 0;
   CUcontext ctx;
+  if (!gpu_open_cu()) {
+    return false;
+  }
+#ifdef _WIN32
+  if (getenv("CUDA_DEVICE_MAX_CONNECTIONS") == NULL) {
+    _putenv("CUDA_DEVICE_MAX_CONNECTIONS=1");
+  }
+  // Windows has no concurrent managed access. The host never touches the
+  // corpus while a kernel runs (it waits in cuCtxSynchronize), so plain
+  // managed memory is enough; a host page is slow to share, though (see
+  // gpu_map), so only small work should cross.
+  CUdevice_attribute need = CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY;
+#else
   setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
+  CUdevice_attribute need = CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS;
+#endif
   if (cuInit(0) == CUDA_SUCCESS && cuDeviceGet(&gpu_dev, 0) == CUDA_SUCCESS) {
-    cuDeviceGetAttribute(&managed,
-      CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, gpu_dev);
+    cuDeviceGetAttribute(&managed, need, gpu_dev);
   }
   int l2 = 1 << 23;
   cuDeviceGetAttribute(&l2, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, gpu_dev);
   gpu_shape(l2 >> 16);
   return managed != 0
     && cuDevicePrimaryCtxRetain(&ctx, gpu_dev) == CUDA_SUCCESS
-    && cuCtxSetCurrent(ctx) == CUDA_SUCCESS;
+    && cuCtxSetCurrent(ctx) == CUDA_SUCCESS && gpu_ready();
 }
 
 static u64* gpu_map(u64 bytes) {
@@ -5117,6 +5426,9 @@ static bool gpu_make(const char* path) {
   snprintf(arch, sizeof arch, "--gpu-architecture=sm_%d%d", cc[0], cc[1]);
   snprintf(bag, sizeof bag, "-DCUBE_LOG=%u", CUBE_LOG);
   const char* opts[] = { arch, bag, "--fmad=false", "-default-device" };
+  if (!gpu_open_rtc()) {
+    err_fail("cannot find NVRTC to compile the GPU program");
+  }
   nvrtcProgram prog;
   if (nvrtcCreateProgram(&prog, BEND_SRC, "bend.cu", 0, NULL, NULL)
     != NVRTC_SUCCESS) {
@@ -5157,19 +5469,23 @@ static u64 gpu_span(void) {
 
 static void gpu_load(u64 bytes) {
   const char* path = gpu_path();
-  int         fd   = open(path, O_RDONLY);
-  struct stat st   = { 0 };
+  FILE*       in   = fopen(path, "rb");
+  long        size = in != NULL && fseek(in, 0, SEEK_END) == 0 ? ftell(in) : 0;
+  char*       bin  = size > 8 ? malloc((size_t)size) : NULL;
   u64         key  = 0;
-  char*       bin  = fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 8 ? NULL
-    : mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (bin != NULL && bin != MAP_FAILED) {
+  if (bin != NULL && fseek(in, 0, SEEK_SET) == 0
+    && fread(bin, 1, (size_t)size, in) == (size_t)size) {
     memcpy(&key, bin, 8);
+  }
+  if (in != NULL) {
+    fclose(in);
   }
   if (key != gpu_hash()
     || cuModuleLoadData(&gpu_lib, bin + 8) != CUDA_SUCCESS) {
     gpu_note(path);
     gpu_make(path);
   }
+  free(bin);
   if (cuModuleGetFunction(&gpu_pso, gpu_lib, "bend_dev") != CUDA_SUCCESS) {
     err_fail("cannot load the GPU program");
   }
@@ -5248,7 +5564,7 @@ static void* corpus_map(u64 size) {
   void* p    = pool_try((void*)hint, size);
   while (p != (void*)hint && hint > size) {
     if (p != MAP_FAILED) {
-      munmap(p, size);
+      pool_free(p, size);
     }
     hint /= 2;
     p     = pool_try((void*)hint, size);
@@ -5289,7 +5605,7 @@ static bool corpus_grow(u64* H, u64 need) {
     if (ok) {
       corpus_lay(H, more * 2);
     } else if (got != MAP_FAILED) {
-      munmap(got, more);
+      pool_free(got, more);
     }
   }
   UNLOCK(bank_lock);
@@ -5373,11 +5689,13 @@ OUTLINE Term corpus_eval(u64* H, Term t) {
 // macOS poll misses FIFO EOF, so io_wait selects, its sets sized to the
 // highest fd (_DARWIN_UNLIMITED_SELECT allows fds past FD_SETSIZE).
 
-#include <arpa/inet.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 #define IO_READ 1
 #define IO_TIME 2
@@ -5430,6 +5748,7 @@ OUTLINE void* io_mem(void* mem) {
   return mem;
 }
 
+#ifndef _WIN32
 static int io_sys_addr(const char* host, u32 port, struct sockaddr_in* at) {
   memset(at, 0, sizeof(*at));
   at->sin_family = AF_INET;
@@ -5443,6 +5762,7 @@ static int io_sys_addr(const char* host, u32 port, struct sockaddr_in* at) {
   return port > 65535 || inet_pton(AF_INET, host, &at->sin_addr) != 1
     ? -1 : 0;
 }
+#endif
 
 static int    io_argc;
 static char** io_argv;
@@ -5618,7 +5938,36 @@ static pthread_mutex_t io_gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  io_bell = PTHREAD_COND_INITIALIZER;
 static u32             io_busy;
 static u32             io_size;
-static int             io_wake_fd[2];
+#ifdef _WIN32
+
+// Windows select() takes sockets only, so a finished work item goes on a
+// list under io_gate and rings io_done_bell, which io_wait sleeps on.
+static IoWork*        io_done;
+static pthread_cond_t io_done_bell = PTHREAD_COND_INITIALIZER;
+
+static void io_take(Env e) {
+  pthread_mutex_lock(&io_gate);
+  IoWork* acts = io_done;
+  io_done      = NULL;
+  pthread_mutex_unlock(&io_gate);
+  while (acts != NULL) {
+    IoWork* a = io_pop(&acts);
+    a->item   = a->pack(e, a);
+    io_push(&io_runs, a);
+    io_busy -= 1;
+  }
+}
+
+static void io_ring(IoWork* a) {
+  pthread_mutex_lock(&io_gate);
+  io_push(&io_done, a);
+  pthread_cond_signal(&io_done_bell);
+  pthread_mutex_unlock(&io_gate);
+}
+
+#else
+
+static int io_wake_fd[2];
 
 static void io_take(Env e) {
   IoWork* acts[64];
@@ -5633,6 +5982,13 @@ static void io_take(Env e) {
   }
 }
 
+static void io_ring(IoWork* a) {
+  while (write(io_wake_fd[1], &a, sizeof a) != sizeof a) {
+  }
+}
+
+#endif
+
 static void* io_help(void* arg) {
   for (;;) {
     pthread_mutex_lock(&io_gate);
@@ -5642,8 +5998,7 @@ static void* io_help(void* arg) {
     IoWork* a = io_pop(&io_jobs);
     pthread_mutex_unlock(&io_gate);
     a->call(a);
-    while (write(io_wake_fd[1], &a, sizeof a) != sizeof a) {
-    }
+    io_ring(a);
   }
 }
 
@@ -5680,6 +6035,59 @@ static bool io_bit(u8* set, int fd, bool put) {
   *at |= put << fd % 8;
   return *at >> fd % 8 & 1;
 }
+
+#ifdef _WIN32
+
+// Sleeps until a work item finishes or the soonest timer is due. Waiting on
+// a handle (a socket or a process) is not supported on Windows yet.
+static void io_wait(Env e) {
+  u64 soon = 0;
+  for (IoWork* a = io_park; a != NULL;
+    a = a->next != io_park ? a->next : NULL) {
+    if (a->evts != 0) {
+      err_fail("waiting on a socket or process is not supported on Windows");
+    }
+    if (a->time != 0 && (soon == 0 || a->time < soon)) {
+      soon = a->time;
+    }
+  }
+  io_sync();
+  pthread_mutex_lock(&io_gate);
+  if (io_done == NULL) {
+    if (soon == 0) {
+      pthread_cond_wait(&io_done_bell, &io_gate);
+    } else {
+      u64 tick = io_tick();
+      if (soon > tick) {
+        struct timespec at;
+        clock_gettime(CLOCK_REALTIME, &at);
+        u64 ns = (u64)at.tv_nsec + (soon - tick);
+        at.tv_sec  += (time_t)(ns / 1000000000ull);
+        at.tv_nsec  = (long)(ns % 1000000000ull);
+        pthread_cond_timedwait(&io_done_bell, &io_gate, &at);
+      }
+    }
+  }
+  pthread_mutex_unlock(&io_gate);
+  io_take(e);
+  u64     now  = io_tick();
+  IoWork* todo = io_park;
+  io_park = NULL;
+  while (todo != NULL) {
+    IoWork* a = io_pop(&todo);
+    if (a->time == 0 || a->time > now) {
+      io_push(&io_park, a);
+      continue;
+    }
+    Term x = a->pack(e, a);
+    if (x != IO_PARK) {
+      a->item = x;
+      io_push(&io_runs, a);
+    }
+  }
+}
+
+#else
 
 static void io_wait(Env e) {
   int top  = io_wake_fd[0];
@@ -5737,6 +6145,8 @@ static void io_wait(Env e) {
   }
   free(set[0]);
 }
+
+#endif
 
 ${NATIVE.IO}
 
@@ -5912,10 +6322,12 @@ static void io_step(Env e, IoWork* a) {
 OUTLINE void io_loop(u64* H) {
   Env e = { H, ALC[0] };
   io_stk = pool_stack();
+#ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
   if (pipe(io_wake_fd) | fcntl(io_wake_fd[0], F_SETFL, O_NONBLOCK)) {
     err_fail("the event loop failed to open");
   }
+#endif
   Term m = corpus_eval(H, term_tsk(MAIN_FID, task_node(e, MAIN_FID,
     TERM_HOLE, 0, 0)));
 #if MAIN_PURE
