@@ -3444,6 +3444,7 @@ typedef struct CUstream_st* CUstream;
 typedef int                 CUmem_advise;
 typedef struct { int type; int id; } CUmemLocation;
 typedef enum {
+  CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16,
   CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE = 38,
   CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75,
   CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76,
@@ -3472,6 +3473,8 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy,
 CUresult CUDAAPI cuMemAlloc(CUdeviceptr* p, size_t bytes);
 CUresult CUDAAPI cuMemcpyDtoH(void* dst, CUdeviceptr src, size_t bytes);
 CUresult CUDAAPI cuMemFree(CUdeviceptr p);
+CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dst, CUdeviceptr src, size_t bytes);
+CUresult CUDAAPI cuMemAllocHost(void** p, size_t bytes);
 nvrtcResult nvrtcCreateProgram(nvrtcProgram* p, const char* src, const char* name,
   int nh, const char* const* headers, const char* const* names);
 nvrtcResult nvrtcCompileProgram(nvrtcProgram p, int n, const char* const* opts);
@@ -3491,7 +3494,8 @@ nvrtcResult nvrtcDestroyProgram(nvrtcProgram* p);
   X(cuModuleLoadData, cuModuleLoadData) \
   X(cuModuleGetFunction, cuModuleGetFunction) \
   X(cuLaunchKernel, cuLaunchKernel) X(cuMemAlloc, cuMemAlloc_v2) \
-  X(cuMemcpyDtoH, cuMemcpyDtoH_v2) X(cuMemFree, cuMemFree_v2)
+  X(cuMemcpyDtoH, cuMemcpyDtoH_v2) X(cuMemFree, cuMemFree_v2) \
+  X(cuMemcpyDtoD, cuMemcpyDtoD_v2) X(cuMemAllocHost, cuMemAllocHost_v2)
 
 #define GPU_RTC_FNS(X) \
   X(nvrtcCreateProgram, nvrtcCreateProgram) \
@@ -3521,6 +3525,8 @@ GPU_RTC_FNS(GPU_FN_PTR)
 #define cuMemAlloc               (*gpu_fn_cuMemAlloc)
 #define cuMemcpyDtoH             (*gpu_fn_cuMemcpyDtoH)
 #define cuMemFree                (*gpu_fn_cuMemFree)
+#define cuMemcpyDtoD             (*gpu_fn_cuMemcpyDtoD)
+#define cuMemAllocHost           (*gpu_fn_cuMemAllocHost)
 #define nvrtcCreateProgram       (*gpu_fn_nvrtcCreateProgram)
 #define nvrtcCompileProgram      (*gpu_fn_nvrtcCompileProgram)
 #define nvrtcGetProgramLogSize   (*gpu_fn_nvrtcGetProgramLogSize)
@@ -5394,9 +5400,19 @@ static bool gpu_probe(void) {
   if (cuInit(0) == CUDA_SUCCESS && cuDeviceGet(&gpu_dev, 0) == CUDA_SUCCESS) {
     cuDeviceGetAttribute(&managed, need, gpu_dev);
   }
+  // A group per 64 KB of L2, and at least one per multiprocessor (rounded up to a power of two):
+  // L2 alone leaves most of a big NVIDIA part idle (an RTX 3090 got 64 groups, 8,192 threads,
+  // for 82 multiprocessors of 1,536 threads each), and a compute-bound bang runs twice as fast
+  // with 128.
   int l2 = 1 << 23;
+  int sms = 0;
   cuDeviceGetAttribute(&l2, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, gpu_dev);
-  gpu_shape(l2 >> 16);
+  cuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, gpu_dev);
+  int units = l2 >> 16, per_sm = 1;
+  while (per_sm < sms) {
+    per_sm *= 2;
+  }
+  gpu_shape(units > per_sm ? units : per_sm);
   return managed != 0
     && cuDevicePrimaryCtxRetain(&ctx, gpu_dev) == CUDA_SUCCESS
     && cuCtxSetCurrent(ctx) == CUDA_SUCCESS && gpu_ready();
