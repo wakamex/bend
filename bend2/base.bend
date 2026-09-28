@@ -2292,6 +2292,32 @@ def Array.fork(-T: Type, +a: Array<T>) -> Array<T> & Array<T>:
 def Array.join(-T: Type, a: Array<T>, b: Array<T>) -> Array<T>:
   a
 
+# A spread runs f(i, x, a) for every i below n, in parallel, each on a
+# handle of a (as a fork's), and joins them back into a. Written as a
+# loop over a stride (i, i + st, ... c times), which is what runs on a
+# CPU, in sequence, or on one lane; on the GPU the growing passes split
+# the loop across a group's lanes, every lane making its own part at
+# once, and a part's join only counts it in (comp.ts, spread_split),
+# so n leaves cost no tree of forks and joins. The runtime reads the
+# loop's words in this order: c, a, i, st, then x.
+@unsafe
+def Array.spread.run(
+  ~T: Type, ~C: Data, ~f: @+i: U32 -> @+x: C -> Array<T> -> Array<T>,
+  c: Nat, a: Array<T>, +i: U32, +st: U32, +x: C
+) -> Array<T>:
+  match c:
+    case 0n:
+      a
+    case 1n+r:
+      Array.spread.run(~T, ~C, ~f, r, f(i, x, a), U32.add(i, st), st, x)
+
+def Array.spread(
+  ~T: Type, ~C: Data, ~f: @+i: U32 -> @+x: C -> Array<T> -> Array<T>,
+  a: Array<T>, +n: U32, +x: C
+) -> Array<T>:
+  r = Array.spread.run(~T, ~C, ~f, U32.to_nat(n), a, 0, 1, x)
+  r
+
 law Array.atomic.add:
   for  a: Array<U32>
   for +i: U32

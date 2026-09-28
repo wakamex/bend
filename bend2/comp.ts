@@ -1306,7 +1306,7 @@ function flat_of(k: Name): boolean {
   return memo(FLATS, k, () => {
     const deps = SRCS.get(k);
     FLATS.set(k, false);
-    return deps != null && [...deps].every(flat_of);
+    return deps != null && !spread_def(k) && [...deps].every(flat_of);
   });
 }
 
@@ -2615,10 +2615,16 @@ function emit_body(fl: File, tm: HTerm, ty0: HTerm | null,
   }
 }
 
+// A spread's loop (Array.spread.run and its instances): on the device its
+// call runs as a task, which the growing passes split (spread_split).
+function spread_def(k: Name | null): boolean {
+  return k === "Array.spread.run" || !!k?.startsWith("Array.spread.run~");
+}
+
 function emit_fork(fl: File, x: Of<"Let">, ers: HTerm[]): void {
   const o = term_open(x);
   const calls = x.v.map((v) => term_spine(fl, v));
-  const fork = calls.length > 1;
+  const fork = calls.length > 1 || (!fl.js && spread_def(calls[0].k));
   const name = seg_name(fl, "j");
   let hold: Of<"Var">[] = [];
   if (fork) {
@@ -2894,7 +2900,8 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
   defs.push(`CONSTV u8 FID_T[][3] = { ${entries.map((s) =>
     `{ ${s.params.length}, ${s.frame === null ? 0
       : s.params.length - s.frame.at.length}, ${Number(fl.bangs.has(s.def))
-      | Number(!forky.has(s.fid)) << 1} }`).join(", ")} };`,
+      | Number(!forky.has(s.fid)) << 1
+      | Number(spread_def(s.def) && s.fid === seg_fid(s.def)) << 2} }`).join(", ")} };`,
   `CONSTV u8 CID_T[][2] = { ${[...cids.keys()].map((k, i) =>
     `{ ${ars[i]}, ${Number(fl.hot.has(k))} }`).join(", ")} };`);
   defs.push(`#define STAT_LEN ${fl.img.length}`, "");
@@ -2948,6 +2955,9 @@ export function compile_book(book: Bend.Book): string {
     fl.spins = [];
     fl.img = [];
     for (const [k, tld] of done_defs(fl).reverse()) {
+      if (spread_def(k)) {
+        fl.hot.add("t:Array");  // its parts share the array (spread_split)
+      }
       memo_gc();
       const [dl, vals] = emit_open({ ...fl, fresh: new Map(),
         brwl: new Map(), rest: [] }, k);
@@ -3871,6 +3881,7 @@ ${tabs}
 #define fid_resw(x)  ((u32)FID_T[x][1])
 #define fid_bangs(x) ((bool)(FID_T[x][2] & 1))
 #define fid_nofk(x)  ((bool)(FID_T[x][2] & 2))
+#define fid_sprd(x)  ((bool)(FID_T[x][2] & 4))
 #define cid_arity(x) ((u32)CID_T[x][0])
 #define cid_hot(x)   ((bool)CID_T[x][1])
 
@@ -4567,6 +4578,37 @@ INLINE Term task_deliver(DEV u64* H, Term cont, u32 idx, THR Term* v, u32 n) {
   return 0;
 }
 
+// A spread's loop (Array.spread.run in base.bend) keeps its words in this
+// order. Split, a loop becomes the join of its parts (spread_split): each
+// part owns a reference to the array and gives back a handle; one that gives
+// back the same handle is only counted, and the join returns those references
+// at once, when its last part is in, rather than one atomic each.
+#define SPRD_C  0
+#define SPRD_A  1
+#define SPRD_I  2
+#define SPRD_ST 3
+
+INLINE Term spread_give(Env e, Term cont, Term v) {
+  DEV u64* H   = e.mem;
+  u64      loc = term_loc(cont);
+  if (v == H[loc + SPRD_A]) {
+    a32_add(a32_at(H, loc + SPRD_ST), 1);
+  } else {
+    term_sink(e, v);
+  }
+  u64 tl = task_tail(cont);
+  if (a32_sub_rel(a32_at(H, tl + 1), 1) == 1) {
+    a32_acq(a32_at(H, tl + 1));
+    u32  back = a32_load(a32_at(H, loc + SPRD_ST));
+    Term a    = H[loc + SPRD_A];
+    if (back != 0 && term_rfc(a)) {
+      a32_sub(a32_at(H, term_loc(a)), back);  // (its own reference stays)
+    }
+    return cont;
+  }
+  return 0;
+}
+
 // A fork's children go out as ring_push would push them, but the high words
 // (which a reader loads first, acquiring, and which make an entry whole)
 // wait until every child's slot is claimed and its low word written, after
@@ -4764,6 +4806,9 @@ ${segs}
       WL_TAKE(rv)
       WL_DYN(wf);
     }
+    if (cont != TERM_HOLE && fid_sprd((u32)term_aux(cont))) {
+      return spread_give(e, cont, rv[0]);
+    }
     return task_deliver(e.mem, cont, idx, rv, n);
   }}
 
@@ -4780,6 +4825,88 @@ ${segs}
 // Monk
 // ====
 
+#if DEVICE
+// A growing lane that meets a spread's loop with two or more steps left posts
+// it for its group (monk_step returns 3 + 4 * its place in the list), and
+// after the round's barrier the group splits every loop posted at once
+// (spread_split): each loop's lane makes it the join of its parts, then each
+// lane makes one part, a loop over every parts-th step, and queues it on its
+// own ring. A loop of 32,768 steps takes two rounds: one group splits it into
+// 256, then each group splits its two into 128 each.
+#define SPRD_N    3   // vote: loops posted this round
+#define SPRD_STOP 4   // vote: too many to split; none more this pass
+#define SPRD_LIST 16  // vote: a posted loop's task, then its i, c and st
+
+INLINE u32 spread_post(DEV u64* H, Term t, TG u32* vote) {
+  u32     k   = a32_add(vote + SPRD_N, 1);
+  u64     loc = term_loc(t);
+  TG u32* p   = vote + SPRD_LIST + 5 * k;
+  p[0] = (u32)t, p[1] = (u32)(t >> 32);
+  p[2] = (u32)H[loc + SPRD_I], p[3] = (u32)H[loc + SPRD_C];
+  p[4] = (u32)H[loc + SPRD_ST];
+  return k;
+}
+
+INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
+  u32 ran) {
+  DEV u64* H    = e.mem;
+  u32      m    = CUBE_T / posted;  // lanes a loop
+  bool     mine = (ran & 3) == 3;
+  TG u32*  own  = vote + SPRD_LIST + 5 * (ran >> 2);
+  Term     t    = mine ? own[0] | (u64)own[1] << 32 : 0;
+  if (m < 2) {
+    if (mine) {
+      ring_push(H, rg, t);
+    }
+    BARD();
+    if (lane == 0) {
+      a32_store(vote + SPRD_N, 0);
+      a32_store(vote + SPRD_STOP, 1);
+    }
+    return;
+  }
+  if (mine) {
+    u64 loc   = term_loc(t);
+    u32 ar    = fid_arity((u32)term_aux(t));
+    u32 parts = own[3] < m ? own[3] : m;
+    H[loc + SPRD_A] = term_keep(e, H[loc + SPRD_A], parts);
+    for (u32 w = SPRD_ST + 1; w < ar; w += 1) {
+      if (!term_triv(H[loc + w])) {
+        H[loc + w] = term_keep(e, H[loc + w], parts);
+      }
+    }
+    H[loc + SPRD_C]      = 0;  // resumed, it returns the array
+    H[loc + SPRD_ST]     = 0;  // counts the parts giving it back
+    H[loc + ar + 1]      = (H[loc + ar + 1] & ~0xFFFFFFFFull) | parts;
+  }
+  BARD();
+  u32 k = lane / m, q = lane % m;
+  if (k < posted) {
+    TG u32* p     = vote + SPRD_LIST + 5 * k;
+    Term    pt    = p[0] | (u64)p[1] << 32;
+    u32     c     = p[3];
+    u32     parts = c < m ? c : m;
+    if (q < parts) {
+      u32 f   = (u32)term_aux(pt);
+      u64 loc = term_loc(pt);
+      u32 ar  = fid_arity(f);
+      u64 n   = task_node(e, f, pt, 0, 0);
+      for (u32 w = 0; w < ar; w += 1) {
+        H[n + w] = H[loc + w];
+      }
+      H[n + SPRD_C]  = (c - q + parts - 1) / parts;
+      H[n + SPRD_I]  = (u32)(p[2] + q * p[4]);
+      H[n + SPRD_ST] = (u32)(p[4] * parts);
+      ring_push(H, rg, term_tsk(f, n));
+    }
+  }
+  BARD();
+  if (lane == 0) {
+    a32_store(vote + SPRD_N, 0);
+  }
+}
+#endif
+
 // One turn on a ring: its head task below put0 runs (a growing
 // lane skips a fork-free one). The host grows a row ring by
 // ring and drains a ring; a device lane does both.
@@ -4794,7 +4921,17 @@ INLINE u32 monk_step(Env e, DEV Term* stk, u32 rg, u32 put0, u32 base, u32 strid
   DEV u32* lo = (DEV u32*)ring_slot(H, rg, *get);
   u32      hi = a32_load_acq(lo + 1);
   Term     t  = (((u64)hi << 32) | a32_load(lo)) & ~RFC_BIT;
-  if ((hi >> 31) != ring_lap(*get) || (!seq && fid_nofk((u32)term_aux(t)))) {
+  if ((hi >> 31) != ring_lap(*get)) {
+    return 0;
+  }
+#if DEVICE
+  if (!seq && fid_sprd((u32)term_aux(t)) && H[term_loc(t) + SPRD_C] >= 2
+    && a32_load(cur + SPRD_STOP) == 0) {
+    a32_store(get, *get + 1);
+    return 3 + 4 * spread_post(H, t, cur);
+  }
+#endif
+  if (!seq && fid_nofk((u32)term_aux(t))) {
     return 0;
   }
   a32_store(get, *get + 1);
@@ -4894,7 +5031,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   Env  e      = { H, H + ALC_OFF + me };
   DEV Term*  stk    = (DEV Term*)(H + STAK_OFF + me);
   if (lane == 0) {
-    for (u32 i = 0; i < 3; i += 1) {
+    for (u32 i = 0; i < 5; i += 1) {
       a32_store(vote + i, 0);
     }
   }
@@ -4924,10 +5061,14 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
     u32 ran = monk_step(e, stk, rg, put0, row * CUBE_T, pass ? 0 : stride,
       vote);
     if (!pass) {
-      if (ran == 1) {
+      if (ran == 1 || (ran & 3) == 3) {
         a32_add(vote + 1, 1);
       }
       BARD();
+      u32 posted = a32_load(vote + SPRD_N);
+      if (posted != 0) {
+        spread_split(e, vote, lane, rg, posted, ran);
+      }
       u32 grew = a32_load(vote + 1);
       if (grew == seen_grew) {
         break;
