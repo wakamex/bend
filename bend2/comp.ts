@@ -5542,8 +5542,9 @@ static void gpu_pages_run(u32* list, u32 n, u64* stage, u32 in) {
 // same pages every time, so after the first time it touches a page, the page
 // costs no protection change at all: at hundreds of frames a second the
 // changes ran to a hundred thousand a second. Without give_up the written
-// pages become readable only, and the hot ones stay.
-static void gpu_send(bool give_up) {
+// pages become readable only, and the hot ones stay; and only pages lo to hi
+// are sent (the ones a copy on the device is about to read).
+static void gpu_send(bool give_up, u64 lo, u64 hi) {
   AcquireSRWLockExclusive(&gpu_lock);
   qsort(gpu_list, gpu_nheld, sizeof *gpu_list, gpu_page_cmp);
   u32 m = 0, kept = 0;
@@ -5554,6 +5555,13 @@ static void gpu_send(bool give_up) {
       && gpu_held[gpu_list[j]] == st; j += 1) {
     }
     u64 n = j - k;
+    if (!give_up) {
+      u64 a = i < lo ? lo : i, b = i + n < hi ? i + n : hi;
+      if (a >= b) {
+        continue;
+      }
+      i = a, n = b - a;
+    }
     if (st >= 2 && n >= GPU_RUN) {
       if (cuMemcpyHtoD(gpu_base + (i << 12), gpu_fill + (i << 12), n << 12)
         != CUDA_SUCCESS) {
@@ -5645,21 +5653,22 @@ static u64* gpu_map(u64 bytes) {
   return (u64*)view;
 }
 
-// A host address in the corpus, on the device, once the host's writes there
-// have gone back.
-static CUdeviceptr gpu_at(const void* p) {
-  gpu_send(false);
-  return gpu_base + (CUdeviceptr)((const char*)p - (const char*)CORPUS);
+// A host address in the corpus, on the device, once the host's writes to its
+// next bytes have gone back.
+static CUdeviceptr gpu_at(const void* p, u64 bytes) {
+  u64 at = (u64)((const char*)p - (const char*)CORPUS);
+  gpu_send(false, at >> 12, (at + bytes + 4095) >> 12);
+  return gpu_base + at;
 }
 
 #define gpu_dev_base() gpu_base
 
 #else
 
-#define gpu_send(give_up)
+#define gpu_send(give_up, lo, hi)
 #define gpu_fetch_queue()
 #define gpu_fetch_take()
-#define gpu_at(p) ((CUdeviceptr)(uintptr_t)(p))
+#define gpu_at(p, bytes) ((CUdeviceptr)(uintptr_t)(p))
 #define gpu_dev_base() ((CUdeviceptr)(uintptr_t)CORPUS)
 
 static u64* gpu_map(u64 bytes) {
@@ -5769,7 +5778,7 @@ static void gpu_kernel(u32 pass, u32 groups) {
 }
 
 static void gpu_pass(u32 f) {
-  gpu_send(true);
+  gpu_send(true, 0, ~0ull);
   gpu_run(f);
   gpu_fetch_queue();
   if (cuCtxSynchronize() != CUDA_SUCCESS) {
@@ -5893,7 +5902,7 @@ static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   u64* H     = CORPUS;
 #if BEND_CUDA
   if (gpu) {
-    cuMemsetD8(gpu_at(H), 0, STAK_OFF * 8);
+    cuMemsetD8(gpu_at(H, STAK_OFF * 8), 0, STAK_OFF * 8);
     cuCtxSynchronize();
   }
 #endif
