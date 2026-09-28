@@ -3770,13 +3770,13 @@ typedef u32 __attribute__((may_alias)) u32a;
 #define LINE      16
 #define PAGE_BITS 7
 #define PAGE_LEN  (1ull << PAGE_BITS)
-#define CUBE_T    128
-#define CUBE      ((u64)CUBE_T * CUBE_T)
+#define CUBE_T    256
+#define CUBE      ((u64)CUBE_T << 7)
 #define CUBE_G    (1u << CUBE_LOG)
 #define LANES     ((u64)CUBE_T << CUBE_LOG)
-#define RING_LOG  (17 - CUBE_LOG)
+#define RING_LOG  (16 - CUBE_LOG)
 #define RING_LEN  (1ull << RING_LOG)
-#define STAK_LEN  (1ull << 11)
+#define STAK_LEN  (1ull << 10)
 #define NCLS      8
 #define NCLS_ALL  32
 #define IO_HELP   64
@@ -3789,7 +3789,7 @@ typedef u32 __attribute__((may_alias)) u32a;
 #if DEVICE
 #define KEEP_WORDS CHUNK
 #endif
-#define RING_WORDS ((1ull << 10) + 2)
+#define RING_WORDS ((1ull << 9) + 2)
 
 #define H_BUMP       0
 #define H_CAP        1
