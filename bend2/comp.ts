@@ -5511,10 +5511,6 @@ static bool gpu_probe(void) {
 // wait, ready before the host asks.
 
 static CUdeviceptr gpu_base;  // the corpus on the device
-// The device memory for the corpus, if the embedder gives its own (shared with
-// a graphics API, so frames drawn in the corpus can be shown from it); 0, or
-// no hook, and cuMemAlloc gives it. Called once, with the context current.
-static CUdeviceptr (*gpu_corpus_mem)(u64 bytes);
 static char*       gpu_fill;  // the host's copy, always writable
 static u8*         gpu_held;  // per page: 0 not held, 1 held, 2 held and written, 3 hot
 static u32*        gpu_list;  // the pages held
@@ -5697,8 +5693,7 @@ static u64* gpu_map(u64 bytes) {
     || cuMemAllocHost((void**)&gpu_in_stage, GPU_STAGE << 12) != CUDA_SUCCESS
     || cuMemAllocHost((void**)&gpu_out_stage, GPU_STAGE << 12) != CUDA_SUCCESS
     || !VirtualProtect(view, bytes, PAGE_NOACCESS, &old)
-    || (!(gpu_corpus_mem && (gpu_base = gpu_corpus_mem(bytes)) != 0)
-      && cuMemAlloc(&gpu_base, bytes) != CUDA_SUCCESS)
+    || cuMemAlloc(&gpu_base, bytes) != CUDA_SUCCESS
     || cuMemsetD8(gpu_base, 0, bytes) != CUDA_SUCCESS) {
     err_fail("corpus reservation failed");
   }
