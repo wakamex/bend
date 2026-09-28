@@ -5476,7 +5476,7 @@ static bool gpu_probe(void) {
 
 static CUdeviceptr gpu_base;  // the corpus on the device
 static char*       gpu_fill;  // the host's copy, always writable
-static u8*         gpu_held;  // per page: 0 not held, 1 held, 2 held and written
+static u8*         gpu_held;  // per page: 0 not held, 1 held, 2 held and written, 3 hot
 static u32*        gpu_list;  // the pages held
 static u32         gpu_nheld;
 static u32*        gpu_last;  // the pages held when last given up
@@ -5535,12 +5535,18 @@ static void gpu_pages_run(u32* list, u32 n, u64* stage, u32 in) {
   }
 }
 
-// Sends the written pages back to the device; with give_up, all held pages
-// are then given up (before a launch), else they stay, unwritten.
+// Sends the pages the host may have written back to the device (the written
+// ones and the hot ones). With give_up (before a launch) the held pages are
+// given up, all but up to GPU_STAGE of them, which stay hot: writable, and
+// fetched again after the launch (gpu_fetch_take). The host touches much the
+// same pages every time, so after the first time it touches a page, the page
+// costs no protection change at all: at hundreds of frames a second the
+// changes ran to a hundred thousand a second. Without give_up the written
+// pages become readable only, and the hot ones stay.
 static void gpu_send(bool give_up) {
   AcquireSRWLockExclusive(&gpu_lock);
   qsort(gpu_list, gpu_nheld, sizeof *gpu_list, gpu_page_cmp);
-  u32 m = 0;
+  u32 m = 0, kept = 0;
   for (u32 k = 0, j; k < gpu_nheld; k = j) {
     u64 i  = gpu_list[k];
     u8  st = gpu_held[i];
@@ -5548,12 +5554,12 @@ static void gpu_send(bool give_up) {
       && gpu_held[gpu_list[j]] == st; j += 1) {
     }
     u64 n = j - k;
-    if (st == 2 && n >= GPU_RUN) {
+    if (st >= 2 && n >= GPU_RUN) {
       if (cuMemcpyHtoD(gpu_base + (i << 12), gpu_fill + (i << 12), n << 12)
         != CUDA_SUCCESS) {
         err_fail("device copy failed");
       }
-    } else if (st == 2) {
+    } else if (st >= 2) {
       for (u64 p = i; p < i + n; p += 1) {
         if (m == GPU_STAGE) {
           gpu_pages_run(gpu_in_list, m, gpu_in_stage, 1);
@@ -5564,44 +5570,51 @@ static void gpu_send(bool give_up) {
         gpu_in_list[m++] = (u32)p;
       }
     }
-    if (give_up || st == 2) {
-      gpu_guard(i, n, give_up ? PAGE_NOACCESS : PAGE_READONLY);
+    if (give_up) {
+      u64 keep = kept + n <= GPU_STAGE ? n : GPU_STAGE - kept;
+      for (u64 p = i; p < i + keep; p += 1) {
+        gpu_last[kept++] = (u32)p;  // (its state until the fetch: see gpu_fetch_take)
+      }
+      if (keep < n) {
+        gpu_guard(i + keep, n - keep, PAGE_NOACCESS);
+        memset(gpu_held + i + keep, 0, n - keep);
+      }
+    } else if (st == 2) {
+      gpu_guard(i, n, PAGE_READONLY);
+      memset(gpu_held + i, 1, n);
     }
-    memset(gpu_held + i, give_up ? 0 : 1, n);
   }
   if (m > 0) {
     // (the next use of the stage is after a wait, which this kernel precedes)
     gpu_pages_run(gpu_in_list, m, gpu_in_stage, 1);
   }
   if (give_up) {
-    memcpy(gpu_last, gpu_list, gpu_nheld * sizeof *gpu_list);
-    gpu_nlast = gpu_nheld, gpu_nheld = 0;
+    gpu_nlast = kept, gpu_nheld = 0;
   }
   ReleaseSRWLockExclusive(&gpu_lock);
 }
 
-// After a launch, before its wait: has the pages the host held last time
-// copied out.
+// After a launch, before its wait: has the hot pages copied out.
 static void gpu_fetch_queue(void) {
-  gpu_nout = gpu_nlast < GPU_STAGE ? gpu_nlast : GPU_STAGE;
+  gpu_nout = gpu_nlast;
   memcpy(gpu_out_list, gpu_last, gpu_nout * sizeof *gpu_out_list);
   if (gpu_nout > 0) {
     gpu_pages_run(gpu_out_list, gpu_nout, gpu_out_stage, 0);
   }
 }
 
-// After the wait: those pages, readable (a write then faults only to mark the
-// page written).
+// After the wait: the hot pages, fresh, and writable (a page turning hot
+// changes protection this once).
 static void gpu_fetch_take(void) {
   AcquireSRWLockExclusive(&gpu_lock);
   for (u32 m = 0; m < gpu_nout; m += 1) {
     u64 i = gpu_out_list[m];
-    if (gpu_held[i] == 0) {
-      memcpy(gpu_fill + (i << 12), gpu_out_stage + ((u64)m << 9), 4096);
-      gpu_guard(i, 1, PAGE_READONLY);
-      gpu_held[i]           = 1;
-      gpu_list[gpu_nheld++] = (u32)i;
+    memcpy(gpu_fill + (i << 12), gpu_out_stage + ((u64)m << 9), 4096);
+    if (gpu_held[i] != 3) {
+      gpu_guard(i, 1, PAGE_READWRITE);
+      gpu_held[i] = 3;
     }
+    gpu_list[gpu_nheld++] = (u32)i;
   }
   gpu_nout = 0;
   ReleaseSRWLockExclusive(&gpu_lock);
