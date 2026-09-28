@@ -3458,6 +3458,7 @@ CUresult CUDAAPI cuInit(unsigned int flags);
 CUresult CUDAAPI cuDeviceGet(CUdevice* dev, int ordinal);
 CUresult CUDAAPI cuDeviceGetAttribute(int* v, CUdevice_attribute a, CUdevice dev);
 CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext* ctx, CUdevice dev);
+CUresult CUDAAPI cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags);
 CUresult CUDAAPI cuCtxSetCurrent(CUcontext ctx);
 CUresult CUDAAPI cuCtxSynchronize(void);
 CUresult CUDAAPI cuMemAllocManaged(CUdeviceptr* p, size_t bytes, unsigned int flags);
@@ -3489,6 +3490,7 @@ nvrtcResult nvrtcDestroyProgram(nvrtcProgram* p);
   X(cuInit, cuInit) X(cuDeviceGet, cuDeviceGet) \
   X(cuDeviceGetAttribute, cuDeviceGetAttribute) \
   X(cuDevicePrimaryCtxRetain, cuDevicePrimaryCtxRetain) \
+  X(cuDevicePrimaryCtxSetFlags, cuDevicePrimaryCtxSetFlags_v2) \
   X(cuCtxSetCurrent, cuCtxSetCurrent) X(cuCtxSynchronize, cuCtxSynchronize) \
   X(cuMemAllocManaged, cuMemAllocManaged) X(cuMemAdvise, cuMemAdvise_v2) \
   X(cuMemsetD8, cuMemsetD8_v2) X(cuDeviceTotalMem, cuDeviceTotalMem_v2) \
@@ -3515,6 +3517,7 @@ GPU_RTC_FNS(GPU_FN_PTR)
 #define cuDeviceGet              (*gpu_fn_cuDeviceGet)
 #define cuDeviceGetAttribute     (*gpu_fn_cuDeviceGetAttribute)
 #define cuDevicePrimaryCtxRetain (*gpu_fn_cuDevicePrimaryCtxRetain)
+#define cuDevicePrimaryCtxSetFlags (*gpu_fn_cuDevicePrimaryCtxSetFlags)
 #define cuCtxSetCurrent          (*gpu_fn_cuCtxSetCurrent)
 #define cuCtxSynchronize         (*gpu_fn_cuCtxSynchronize)
 #define cuMemAllocManaged        (*gpu_fn_cuMemAllocManaged)
@@ -5418,6 +5421,11 @@ static bool gpu_probe(void) {
     per_sm *= 2;
   }
   gpu_shape(units > per_sm ? units : per_sm);
+  // The host sleeps while it waits for the device, rather than spinning a
+  // core (CU_CTX_SCHED_BLOCKING_SYNC; ignored if the context is already open).
+  if (managed != 0) {
+    cuDevicePrimaryCtxSetFlags(gpu_dev, 0x04);
+  }
   return managed != 0
     && cuDevicePrimaryCtxRetain(&ctx, gpu_dev) == CUDA_SUCCESS
     && (gpu_ctx = ctx) != NULL
