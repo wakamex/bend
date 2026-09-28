@@ -3384,11 +3384,14 @@ const runtime_c = (tabs: string, spins: string, segs: string,
 #if defined(__CUDACC_RTC__)
 #define BEND_RTC 1
 #endif
+#if defined(__OPENCL_C_VERSION__)
+#define BEND_OCL 1  // OpenCL C, for Vulkan through clspv
+#endif
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 using namespace metal;
-#elif !defined(BEND_RTC)
+#elif !defined(BEND_RTC) && !defined(BEND_OCL)
 #ifdef __APPLE__
 #define _DARWIN_UNLIMITED_SELECT
 #else
@@ -3640,6 +3643,20 @@ static bool gpu_open_rtc(void) {
 #define BAR()   threadgroup_barrier(mem_flags::mem_threadgroup)
 #define BARD()  threadgroup_barrier(mem_flags::mem_device \
   | mem_flags::mem_threadgroup)
+#elif defined(BEND_OCL)
+#define DEV     __global
+#define THR     __private
+#define TG      __local
+// Everything inlines: clspv can't write a function taking an Env (a struct
+// holding a pointer to global memory).
+#define INLINE  static inline __attribute__((always_inline))
+#define OUTLINE INLINE
+#define CONSTV  __constant
+#define DEVICE  1
+#define CLZ(x)  (u32)clz((uint)(x))
+#define FENCE() mem_fence(CLK_GLOBAL_MEM_FENCE)
+#define BAR()   barrier(CLK_LOCAL_MEM_FENCE)
+#define BARD()  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)
 #else
 #define DEV
 #define THR
@@ -3667,7 +3684,11 @@ static bool gpu_open_rtc(void) {
 #endif
 #endif
 #undef FAR  // windows.h has its own
+#ifdef BEND_OCL
+#define FAR INLINE
+#else
 #define FAR static __attribute__((noinline))
+#endif
 
 #if DEVICE
 #define LOCK(l)
@@ -3709,8 +3730,13 @@ static bool gpu_open_rtc(void) {
     STK(wi) = e.mem[A + wi]; \
   } \
   sp += (N - 1) * LANE_STEP;
+#ifdef BEND_OCL  // (spike) no check: Vulkan can't compare pointers, and LLVM
+#define WL_PAST(a, b) false  // folds integer compares of addresses back into them
+#else
+#define WL_PAST(a, b) ((a) >= (b))
+#endif
 #define WL_ROOM(N) \
-  if (DEVICE && sp + (N) * CUBE >= e.mem + STAT_OFF + CUBE) { \
+  if (DEVICE && WL_PAST(sp + (N) * CUBE, e.mem + STAT_OFF + CUBE)) { \
     err_post(e.mem, ERR_DEEP); \
     return 0; \
   }
@@ -3718,7 +3744,7 @@ static bool gpu_open_rtc(void) {
 // Types
 // =====
 
-#ifdef __METAL_VERSION__
+#if defined(__METAL_VERSION__) || defined(BEND_OCL)
 typedef ulong u64;
 typedef uint  u32;
 typedef uchar u8;
@@ -3735,9 +3761,16 @@ typedef float f32;
 
 typedef u64 Term;
 
+// A lane's heap, and its allocator's words. Under OpenCL (clspv) the words
+// are an offset into the heap: clspv mislowers a struct holding a second
+// pointer to global memory, storing it into the heap.
 typedef struct {
   DEV u64* mem;
+#ifdef BEND_OCL
+  u64      alc;
+#else
   DEV u64* alc;
+#endif
 } Env;
 
 typedef struct {
@@ -3934,6 +3967,23 @@ INLINE bool a32_swp(DEV u32* p, u32* e, u32 v) {
   return *e == x;
 }
 
+#elif defined(BEND_OCL)
+
+// OpenCL's own atomics, which take either address space; the loads and
+// stores keep theirs through __typeof__.
+#define A32(p) (p)
+#define atomic_load_explicit(p, o) (*(volatile __typeof__(*(p))*)(p))
+#define atomic_store_explicit(p, v, o) \
+  (*(volatile __typeof__(*(p))*)(p) = (v))
+${a32_ops((k) => `atomic_fetch_${k}_explicit(p, v, o) atomic_${k}(p, v)`)}
+#define atomic_compare_exchange_weak_explicit(p, e, v, s, f) a32_swp(p, e, v)
+
+INLINE bool a32_swp(DEV u32* p, THR u32* e, u32 v) {
+  u32 x = *e;
+  *e = atomic_cmpxchg((volatile DEV u32*)p, x, v);
+  return *e == x;
+}
+
 #else
 
 #define A32(p) ((_Atomic u32*)(p))
@@ -3962,7 +4012,11 @@ INLINE bool a32_swp(DEV u32* p, u32* e, u32 v) {
 ${a32_ops((k) => `a32_${k}(p, v) atomic_fetch_${k}_explicit(A32(p), v, RLX)`)}
 #define a32_sub_rel(p, v)   (FENCE(), atomic_fetch_sub_explicit(A32(p), v, REL))
 #define a32_store_rel(p, v) (FENCE(), atomic_store_explicit(A32(p), v, REL))
+#ifdef BEND_OCL  // (clspv keeps &H[word]'s type, making its atomics 64-bit)
+#define a32_at(H, word)     ((DEV u32*)(H) + 2 * (u64)(word))
+#else
 #define a32_at(H, word)     ((DEV u32*)&(H)[word])
+#endif
 
 INLINE u32 a32_load_acq(DEV u32* p) {
   u32 v = atomic_load_explicit(A32(p), ACQ);
@@ -4031,29 +4085,36 @@ A32_LOOP(fadd, f32_rewrap(f32_unbox(o) + f32_unbox(v)))
 
 #define bank_at(H, c) ((DEV Bank*)((H) + H_BANK) + (c))
 
+// A Bank's fields by its words (off, then rd and wr, then top), made from H:
+// clspv (for Vulkan) indexes the u32 fields of a struct pointer made from a
+// u64 pointer in u64s, as it does ring_word's (see ring_slot32).
+#define bank_word(c)   (H_BANK + 3 * (u64)(c))
+#define bank_off(H, c) (H)[bank_word(c)]
+#define bank_rd(H, c)  a32_at(H, bank_word(c) + 1)
+#define bank_wr(H, c)  (a32_at(H, bank_word(c) + 1) + 1)
+#define bank_top(H, c) a32_at(H, bank_word(c) + 2)
+
 INLINE u64 bank_pop(DEV u64* H, u32 c) {
-  DEV Bank* b = bank_at(H, c);
   u64 got = 0;
   LOCK(bank_lock);
-  u32 t = a32_sub(&b->rd, 1);
+  u32 t = a32_sub(bank_rd(H, c), 1);
   if ((int)t > 0) {
-    got = H[b->off + t - 1];
+    got = H[bank_off(H, c) + t - 1];
   } else {
-    a32_add(&b->rd, 1);
+    a32_add(bank_rd(H, c), 1);
   }
   if (!DEVICE) {
-    b->wr = b->top = b->rd;
+    *bank_wr(H, c) = *bank_top(H, c) = *bank_rd(H, c);
   }
   UNLOCK(bank_lock);
   return got;
 }
 
 INLINE void bank_push(DEV u64* H, u32 c, u64 head) {
-  DEV Bank* b = bank_at(H, c);
   LOCK(bank_lock);
-  H[b->off + a32_add(&b->wr, 1)] = head;
+  H[bank_off(H, c) + a32_add(bank_wr(H, c), 1)] = head;
   if (!DEVICE) {
-    b->rd = b->top = b->wr;
+    *bank_rd(H, c) = *bank_top(H, c) = *bank_wr(H, c);
   }
   UNLOCK(bank_lock);
 }
@@ -4070,8 +4131,15 @@ INLINE void bank_push(DEV u64* H, u32 c, u64 head) {
 // down the chain (0.02 to 0.04 ms a kernel at 32,768 lanes). The bump grows
 // only when all of these are empty.
 
+#ifdef BEND_OCL
+#define ALC_AT(e, i)   (e).mem[(e).alc + (u64)(i) * LANE_STEP]
+#else
 #define ALC_AT(e, i)   (e).alc[(i) * LANE_STEP]
+#endif
 #define ALC_LEN(e, c)  ALC_AT(e, NCLS_ALL + (c))
+// The words in a node of class c (below 32). A 32-bit shift: clspv writes
+// the 128-bit shift LLVM makes of a 64-bit one as an invalid constant.
+#define CLS_WORDS(c)   ((u64)(1u << (c)))
 #define ALC_COLD(e, c) ALC_AT(e, 2 * NCLS_ALL + (c))
 #define KEEP(c)        (KEEP_WORDS >> (c) ? KEEP_WORDS >> (c) : 1)
 
@@ -4125,7 +4193,7 @@ INLINE u64 heap_alloc(Env e, u32 cls) {
   u64 h = ALC_AT(e, cls);
   if (h) {
     ALC_AT(e, cls)   = e.mem[h];
-    ALC_LEN(e, cls) -= 1ull << cls;
+    ALC_LEN(e, cls) -= CLS_WORDS(cls);
     return h;
   }
   return heap_alloc_miss(e, cls);
@@ -4137,7 +4205,7 @@ INLINE void heap_free(Env e, u32 cls, u64 loc) {
   }
   e.mem[loc]       = ALC_AT(e, cls);
   ALC_AT(e, cls)   = loc;
-  ALC_LEN(e, cls) += 1ull << cls;
+  ALC_LEN(e, cls) += CLS_WORDS(cls);
   if (ALC_LEN(e, cls) >= KEEP_WORDS) {
     heap_hand(e, cls);
   }
@@ -4398,7 +4466,7 @@ INLINE Term term_word(Env e, Term w) {
   }
 
 INLINE DEV u32a* blk_ptr(DEV u64* H, u64 loc, u32 i) {
-  return (DEV u32a*)(H + loc) + i;
+  return (DEV u32a*)H + 2 * loc + i;  // (from H, as ring_slot32)
 }
 
 INLINE Term blk_read(DEV u64* H, bool arr, u64 loc, u32 i) {
@@ -4417,7 +4485,7 @@ INLINE void blk_write(DEV u64* H, bool arr, u64 loc, u32 i, Term v) {
 }
 
 INLINE u32 blk_at(Term a, u64 i, u32 lgs) {
-  return ((u32)i & (u32)((1ull << (blk_cls(a) - lgs)) - 1)) << lgs;
+  return ((u32)i & ((1u << (blk_cls(a) - lgs)) - 1)) << lgs;  // (a class < 32)
 }
 
 INLINE Term blk_keep(Env e, u64 at) {
@@ -4519,8 +4587,12 @@ INLINE Term blk_new(Env e, bool arr, u64 d, u32 lgs, u32 n, THR Term* v) {
 // planes LANES wide: a smaller bag has deeper rings in the same region
 #define ring_word(H, r, w) ((H) + RING_OFF + (w) * LANES + (r))
 #define ring_slot(H, r, p) ring_word(H, r, (p) & (RING_LEN - 1))
-#define ring_get(H, r)     ((DEV u32*)ring_word(H, r, RING_LEN))
-#define ring_put(H, r)     ((DEV u32*)ring_word(H, r, RING_LEN + 1))
+// A ring's u32 cells are made from H, not from ring_word's u64 pointer: clspv
+// (for Vulkan) indexes a u32 view of a u64 pointer in u64s, off by half.
+#define ring_index(r, w)   (RING_OFF + (u64)(w) * LANES + (r))
+#define ring_slot32(H, r, p) a32_at(H, ring_index(r, (p) & (RING_LEN - 1)))
+#define ring_get(H, r)     a32_at(H, ring_index(r, RING_LEN))
+#define ring_put(H, r)     a32_at(H, ring_index(r, RING_LEN + 1))
 
 INLINE u32 ring_lap(u32 pos) {
   return ~(u32)(pos / RING_LEN) & 1;
@@ -4532,7 +4604,7 @@ INLINE void ring_push(DEV u64* H, u32 r, Term tsk) {
     err_post(H, ERR_RING);
     return;
   }
-  DEV u32* lo = (DEV u32*)ring_slot(H, r, pos);
+  DEV u32* lo = ring_slot32(H, r, pos);
   a32_store(lo, (u32)tsk);
   a32_store_rel(lo + 1, (u32)(tsk >> 32) | (ring_lap(pos) << 31));
 }
@@ -4627,13 +4699,15 @@ INLINE Term spread_give(Env e, Term cont, Term v) {
 // throughout the one big kernel.)
 #define DEAL_BATCH 16
 
-INLINE void deal_publish(DEV u32* THR* hi, THR u32* hv, u32 n) {
+// hi holds the high words' places as u32 offsets from H (not pointers: an
+// array of pointers doesn't survive clspv's lowering for Vulkan).
+INLINE void deal_publish(DEV u64* H, THR u64* hi, THR u32* hv, u32 n) {
   if (n == 0) {
     return;
   }
   FENCE();
   for (u32 i = 0; i < n; i += 1) {
-    atomic_store_explicit(A32(hi[i]), hv[i], REL);
+    atomic_store_explicit(A32((DEV u32*)H + hi[i]), hv[i], REL);
   }
 }
 
@@ -4645,7 +4719,7 @@ INLINE void task_deal(DEV u64* H, Term join, u32 base, u32 stride, TG u32* cur) 
     u32 rem = (u32)H[loc + ar + 1];
     g = a32_add(a32_at(H, H_CURSOR), rem);
   }
-  DEV u32* hi[DEAL_BATCH];
+  u64      hi[DEAL_BATCH];
   u32      hv[DEAL_BATCH];
   u32      n = 0;
   for (u32 i = 0; i < ar; i += 1) {
@@ -4664,16 +4738,17 @@ INLINE void task_deal(DEV u64* H, Term join, u32 base, u32 stride, TG u32* cur) 
         err_post(H, ERR_RING);
         continue;
       }
-      DEV u32* lo = (DEV u32*)ring_slot(H, to, pos);
+      DEV u32* lo = ring_slot32(H, to, pos);
       a32_store(lo, (u32)k);
-      hi[n] = lo + 1, hv[n] = (u32)(k >> 32) | (ring_lap(pos) << 31), n += 1;
+      hi[n] = 2 * (RING_OFF + (u64)(pos & (RING_LEN - 1)) * LANES + to) + 1;
+      hv[n] = (u32)(k >> 32) | (ring_lap(pos) << 31), n += 1;
       if (n == DEAL_BATCH) {
-        deal_publish(hi, hv, n);
+        deal_publish(H, hi, hv, n);
         n = 0;
       }
     }
   }
-  deal_publish(hi, hv, n);
+  deal_publish(H, hi, hv, n);
 }
 
 // Root
@@ -4964,7 +5039,7 @@ INLINE u32 monk_step(Env e, DEV Term* stk, u32 rg, u32 put0, u32 base, u32 strid
   if (*get == put0) {
     return 0;
   }
-  DEV u32* lo = (DEV u32*)ring_slot(H, rg, *get);
+  DEV u32* lo = ring_slot32(H, rg, *get);
   u32      hi = a32_load_acq(lo + 1);
   Term     t  = (((u64)hi << 32) | a32_load(lo)) & ~RFC_BIT;
   if ((hi >> 31) != ring_lap(*get)) {
@@ -5037,19 +5112,20 @@ INLINE void dev_cut(Env e) {
 
 INLINE void bank_pack(DEV u64* H, u32 lane) {
   for (u32 c = 0; c < NCLS_ALL; c += 1) {
-    DEV Bank* b  = bank_at(H, c);
-    u32       rd = b->rd;
-    u32       n  = b->wr - b->top;
+    u64 off = bank_off(H, c);
+    u32 rd  = *bank_rd(H, c);
+    u32 top = *bank_top(H, c);
+    u32 n   = *bank_wr(H, c) - top;
     for (u32 i = 0; i < n; i += CUBE_T) {
-      Term v = i + lane < n ? H[b->off + b->top + i + lane] : 0;
+      Term v = i + lane < n ? H[off + top + i + lane] : 0;
       BAR();
       if (i + lane < n) {
-        H[b->off + rd + i + lane] = v;
+        H[off + rd + i + lane] = v;
       }
     }
     BAR();
     if (lane == 0) {
-      b->rd = b->wr = b->top = rd + n;
+      *bank_rd(H, c) = *bank_wr(H, c) = *bank_top(H, c) = rd + n;
     }
   }
 }
@@ -5060,6 +5136,15 @@ kernel void bend_dev(DEV u64* H [[buffer(0)]], constant u32& pass [[buffer(1)]],
   u32 grids [[threadgroups_per_grid]],
   u32 row [[threadgroup_position_in_grid]],
   u32 lane [[thread_position_in_threadgroup]]) {
+#elif defined(BEND_OCL)
+// The heap's address comes as an integer and the arguments in a uniform
+// buffer, so the one push constant block is clspv's for the module's
+// constants (Vulkan allows an entry point one). grids is passed, as clspv's
+// get_num_groups would take another push constant.
+__kernel void bend_dev(ulong heap, u32 pass, u32 grids, TG u32* vote) {
+  DEV u64* H = (DEV u64*)heap;
+  u32 row   = get_group_id(0);
+  u32 lane  = get_local_id(0);
 #else
 extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   extern __shared__ u32 vote[];
@@ -5074,7 +5159,11 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   u32  stride = grids == 1 ? CUBE_G : 1;
   u32  me     = row * CUBE_T + stride * lane;
   u32 rg     = pass ? ring_flip(me) : me;
+#ifdef BEND_OCL
+  Env  e      = { H, ALC_OFF + me };
+#else
   Env  e      = { H, H + ALC_OFF + me };
+#endif
   DEV Term*  stk    = (DEV Term*)(H + STAK_OFF + me);
   if (lane == 0) {
     for (u32 i = 0; i < 5; i += 1) {
@@ -5125,7 +5214,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   dev_cut(e);
 }
 
-#ifndef __METAL_VERSION__
+#if !defined(__METAL_VERSION__) && !defined(BEND_OCL)
 // Moves whole pages (512 words, a group each) between the corpus and a
 // page-locked stage on the host: in, the stage's pages to list[i]; out, back.
 extern "C" __global__ void bend_pages(DEV u64* H, const u32* list, u32 n,
