@@ -5483,6 +5483,7 @@ static u32*        gpu_last;  // the pages held when last given up
 static u32         gpu_nlast;
 static u64         gpu_pages;
 static SRWLOCK     gpu_lock = SRWLOCK_INIT;
+static u64         gpu_faults;  // pages fetched on a fault, so far (for measuring)
 static CUfunction  gpu_pages_fn;
 static u32*        gpu_in_list;  // page-locked: pages going in and their words
 static u64*        gpu_in_stage;
@@ -5509,6 +5510,7 @@ static LONG CALLBACK gpu_fault(EXCEPTION_POINTERS* x) {
   bool ok = true;
   AcquireSRWLockExclusive(&gpu_lock);
   if (gpu_held[i] == 0) {
+    gpu_faults += 1;
     cuCtxSetCurrent(gpu_ctx);
     ok = cuMemcpyDtoH(gpu_fill + (i << 12), gpu_base + (i << 12), 4096)
       == CUDA_SUCCESS;
@@ -5669,6 +5671,7 @@ static CUdeviceptr gpu_at(const void* p, u64 bytes) {
 }
 
 #define gpu_dev_base() gpu_base
+#define gpu_fault_count() gpu_faults
 
 #else
 
@@ -5677,6 +5680,7 @@ static CUdeviceptr gpu_at(const void* p, u64 bytes) {
 #define gpu_fetch_take()
 #define gpu_at(p, bytes) ((CUdeviceptr)(uintptr_t)(p))
 #define gpu_dev_base() ((CUdeviceptr)(uintptr_t)CORPUS)
+#define gpu_fault_count() 0ull
 
 static u64* gpu_map(u64 bytes) {
   CUdeviceptr p = 0;
