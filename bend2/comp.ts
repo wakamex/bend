@@ -382,6 +382,15 @@ ${SHIMS}
 #define U32_QUO(a, b) \
   ((a) / 2 / (b) * 2 + ((a) - (a) / 2 / (b) * 2 * (b) >= (b)))
 
+#ifdef BEND_SLANG
+INLINE f32 f32_unbox(u64 x) {
+  return asfloat((u32)x);
+}
+
+INLINE u64 f32_rewrap(f32 x) {
+  return asuint(x);
+}
+#else
 INLINE f32 f32_unbox(u64 x) {
   union { u32 u; f32 f; } p = { (u32)x };
   return p.f;
@@ -391,6 +400,7 @@ INLINE u64 f32_rewrap(f32 x) {
   union { f32 f; u32 u; } p = { x };
   return p.u;
 }
+#endif
 
 INLINE u64 f32_to_u32(u64 a) {
   f32 v = f32_unbox(a);
@@ -1805,7 +1815,8 @@ function arr_new(fl: File, d: string, v: Val, el: Lay): string {
   const { arr, lgs } = lay_arr(el);
   const ws = val_own(fl, val_to(fl, v, el));
   const fv = name_local(fl, "fv");
-  file_push(fl, `Term ${fv}[${Math.max(1, ws.length)}];`);
+  if (ws.length > 16) die("an array literal of over 16 words (WL_OUTN)");
+  file_push(fl, `Term ${fv}[WL_OSZ(${Math.max(1, ws.length)})];`);
   ws.forEach((w, j) => file_push(fl, `${fv}[${j}] = ${w};`));
   return `blk_new(e, ${Number(arr)}, ${d}, ${lgs}, ${ws.length}, ${fv})`;
 }
@@ -2234,7 +2245,8 @@ function emit_fuse(fl: File, ck: Spine, dst: Val | null, tail = false): void {
   const out = emit_dst(fl, ret);
   const name = emit_native(fl, k, ers);
   const o = name_local(fl, "o");
-  file_push(fl, `Term ${o}[${out.ws.length}];`);
+  if (out.ws.length > 16) die("an output of over 16 words (WL_OUTN)");
+  file_push(fl, `Term ${o}[WL_OSZ(${out.ws.length})];`);
   block(fl, `if (${name}(${["e", o, ...ws].join(", ")}) == 0) {`, () => {
     file_push(fl, "return 0;");
   });
@@ -2277,7 +2289,7 @@ function emit_native(fl: File, k: Name, ers: HTerm[]): string {
   emit_body(sl, fun_of(fl, k).h!, fl.book.tlds[k].T, ers, vals, dst);
   FUEL = fuel;
   fl.spins.push({ ...seg, lines: [`${seg.lines.length < SPIN_FAR
-    ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
+    ? "INLINE" : "FAR"} Term ${name}(Env e, WL_OUT(o)${
     seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
   "  u32 wpoll = 0;",
   ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
@@ -3387,11 +3399,14 @@ const runtime_c = (tabs: string, spins: string, segs: string,
 #if defined(__OPENCL_C_VERSION__)
 #define BEND_OCL 1  // OpenCL C, for Vulkan through clspv
 #endif
+#if defined(__SLANG__)
+#define BEND_SLANG 1  // Slang, for Vulkan (SPIR-V with buffer device addresses)
+#endif
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 using namespace metal;
-#elif !defined(BEND_RTC) && !defined(BEND_OCL)
+#elif !defined(BEND_RTC) && !defined(BEND_OCL) && !defined(BEND_SLANG)
 #ifdef __APPLE__
 #define _DARWIN_UNLIMITED_SELECT
 #else
@@ -3657,6 +3672,21 @@ static bool gpu_open_rtc(void) {
 #define FENCE() mem_fence(CLK_GLOBAL_MEM_FENCE)
 #define BAR()   barrier(CLK_LOCAL_MEM_FENCE)
 #define BARD()  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)
+#elif defined(BEND_SLANG)
+// Slang has pointers to device memory only: the group's memory is one array
+// (bend_vote) that a TGP indexes, and a thread's arrays pass inout.
+#define DEV
+#define THR
+#define TG
+#define INLINE
+#define OUTLINE
+#define CONSTV  static const
+#define DEVICE  1
+#define CLZ(x)  ((u32)(31 - firstbithigh((uint)(x))))
+#define long    int64_t
+#define FENCE() DeviceMemoryBarrier()
+#define BAR()   GroupMemoryBarrierWithGroupSync()
+#define BARD()  AllMemoryBarrierWithGroupSync()
 #else
 #define DEV
 #define THR
@@ -3684,10 +3714,29 @@ static bool gpu_open_rtc(void) {
 #endif
 #endif
 #undef FAR  // windows.h has its own
-#ifdef BEND_OCL
+#if defined(BEND_OCL)
 #define FAR INLINE
+#elif defined(BEND_SLANG)
+#define FAR
 #else
 #define FAR static __attribute__((noinline))
+#endif
+
+// A thread's output array (WL_OUT, sized by WL_OSZ), a group-memory pointer
+// (TGP) and a cell of one (TGA): in Slang inout arrays and indices.
+#ifdef BEND_SLANG
+#define WL_OUTN      16
+#define WL_OUT(o)    inout Term o[WL_OUTN]
+#define WL_OSZ(n)    WL_OUTN
+#define THR_ARR(T, v, n) inout T v[n]
+#define TGP          u32
+#define TGA(p, i)    bend_vote[(p) + (i)]
+#else
+#define WL_OUT(o)    THR Term* o
+#define WL_OSZ(n)    n
+#define THR_ARR(T, v, n) THR T* v
+#define TGP          TG u32*
+#define TGA(p, i)    (p)[i]
 #endif
 
 #if DEVICE
@@ -3711,27 +3760,35 @@ static bool gpu_open_rtc(void) {
 #define WL_AGAIN(F) continue
 
 #define LANE_STEP (DEVICE ? (long)CUBE : 1)
-#define STK(I)    sp[(long)(I) * LANE_STEP]
+#ifdef BEND_SLANG  // (NVIDIA's Vulkan misreads a negative pointer index)
+#define STK(I)      (*(DEV Term*)((u64)sp + 8 * (u64)((long)(I) * LANE_STEP)))
+#define SP_MOVE(N)  sp = (DEV Term*)((u64)sp + 8 * (u64)(N))
+#else
+#define STK(I)      sp[(long)(I) * LANE_STEP]
+#define SP_MOVE(N)  sp += (N)
+#endif
 
-#define WL_RETN(N)  { rn = (N); sp -= LANE_STEP; WL_DYN((u32)STK(0)); }
+#define WL_RETN(N)  { rn = (N); SP_MOVE(-(LANE_STEP)); WL_DYN((u32)STK(0)); }
 #define WL_CONT     STK(-3)
 #define WL_IDX      STK(-2)
-#define WL_POPN(N)  sp -= N * LANE_STEP
-#define WL_PUSHN(N) sp += N * LANE_STEP
+#define WL_POPN(N)  SP_MOVE(-(N * LANE_STEP))
+#define WL_PUSHN(N) SP_MOVE(N * LANE_STEP)
 #define WL_FRAME(T) \
   u64 wtl = task_tail(T); \
   u64 wtw = e.mem[wtl + 1]; \
   STK(0) = e.mem[wtl]; \
   STK(1) = (wtw >> 32) & 0xFFFF; \
   STK(2) = FID_EXIT; \
-  sp += 3 * LANE_STEP;
+  SP_MOVE(3 * LANE_STEP);
 #define WL_ARGS(A, N) \
   for (u32 wi = 0; wi + 1 < N; wi += 1) { \
     STK(wi) = e.mem[A + wi]; \
   } \
-  sp += (N - 1) * LANE_STEP;
+  SP_MOVE((N - 1) * LANE_STEP);
 #ifdef BEND_OCL  // (spike) no check: Vulkan can't compare pointers, and LLVM
 #define WL_PAST(a, b) false  // folds integer compares of addresses back into them
+#elif defined(BEND_SLANG)
+#define WL_PAST(a, b) ((u64)(a) >= (u64)(b))
 #else
 #define WL_PAST(a, b) ((a) >= (b))
 #endif
@@ -3748,6 +3805,10 @@ static bool gpu_open_rtc(void) {
 typedef ulong u64;
 typedef uint  u32;
 typedef uchar u8;
+#elif defined(BEND_SLANG)
+typedef uint64_t u64;
+typedef uint     u32;
+typedef uint8_t  u8;
 #elif defined(BEND_RTC)
 typedef unsigned long long u64;
 typedef unsigned int       u32;
@@ -3927,6 +3988,20 @@ ${tabs}
 // Metal's a32_load reads through a volatile local, or the M1 pipeline
 // build dies. A weak CAS may fail with the cell still x: a32_cmpx loops.
 
+#ifdef BEND_SLANG
+#define A32_LOOP(k, x) \
+  u32 a32_##k(DEV u32* p, u32 v) { \
+    u32 o = a32_load(p); \
+    for (;;) { \
+      u32 w; \
+      InterlockedCompareExchange(*p, o, x, w); \
+      if (w == o) { \
+        return o; \
+      } \
+      o = w; \
+    } \
+  }
+#else
 #define A32_LOOP(k, x) \
   INLINE u32 a32_##k(DEV u32* p, u32 v) { \
     u32 o = a32_load(p); \
@@ -3934,6 +4009,7 @@ ${tabs}
     } \
     return o; \
   }
+#endif
 
 #ifdef __METAL_VERSION__
 
@@ -3984,6 +4060,28 @@ INLINE bool a32_swp(DEV u32* p, THR u32* e, u32 v) {
   return *e == x;
 }
 
+#elif defined(BEND_SLANG)
+
+// Device cells by pointer, the group's by index into bend_vote (TGP); every
+// device access an atomic, as Slang has no volatile.
+groupshared u32 bend_vote[TG_HOLD * 2];
+#define A32(p) (p)
+#define memory_order_relaxed 0
+#define memory_order_release 0
+#define memory_order_acquire 0
+#define memory_order_acq_rel 0
+u32 atomic_load_explicit(u32* p, int o) { u32 r; InterlockedAdd(*p, 0u, r); return r; }
+u32 atomic_load_explicit(u32 p, int o) { return bend_vote[p]; }
+void atomic_store_explicit(u32* p, u32 v, int o) { u32 r; InterlockedExchange(*p, v, r); }
+void atomic_store_explicit(u32 p, u32 v, int o) { bend_vote[p] = v; }
+${["Add:add", "And:and", "Or:or", "Xor:xor", "Min:min", "Max:max"].map((kv) => {
+  const [f, k] = kv.split(":");
+  return `u32 atomic_fetch_${k}_explicit(u32* p, u32 v, int o) { u32 r; Interlocked${f}(*p, v, r); return r; }
+u32 atomic_fetch_${k}_explicit(u32 p, u32 v, int o) { u32 r; Interlocked${f}(bend_vote[p], v, r); return r; }`;
+}).join("\n")}
+u32 atomic_fetch_sub_explicit(u32* p, u32 v, int o) { u32 r; InterlockedAdd(*p, 0u - v, r); return r; }
+u32 atomic_fetch_sub_explicit(u32 p, u32 v, int o) { u32 r; InterlockedAdd(bend_vote[p], 0u - v, r); return r; }
+
 #else
 
 #define A32(p) ((_Atomic u32*)(p))
@@ -4012,7 +4110,7 @@ INLINE bool a32_swp(DEV u32* p, THR u32* e, u32 v) {
 ${a32_ops((k) => `a32_${k}(p, v) atomic_fetch_${k}_explicit(A32(p), v, RLX)`)}
 #define a32_sub_rel(p, v)   (FENCE(), atomic_fetch_sub_explicit(A32(p), v, REL))
 #define a32_store_rel(p, v) (FENCE(), atomic_store_explicit(A32(p), v, REL))
-#ifdef BEND_OCL  // (clspv keeps &H[word]'s type, making its atomics 64-bit)
+#if defined(BEND_OCL) || defined(BEND_SLANG)  // (clspv keeps &H[word]'s type)
 #define a32_at(H, word)     ((DEV u32*)(H) + 2 * (u64)(word))
 #else
 #define a32_at(H, word)     ((DEV u32*)&(H)[word])
@@ -4024,6 +4122,15 @@ INLINE u32 a32_load_acq(DEV u32* p) {
   return v;
 }
 
+#ifdef BEND_SLANG
+u32 a32_cmpx(DEV u32* p, u32 x, u32 v) {
+  u32 o;
+  FENCE();
+  InterlockedCompareExchange(*p, x, v, o);
+  FENCE();
+  return o;
+}
+#else
 INLINE bool a32_cas(DEV u32* p, THR u32* e, u32 v) {
   FENCE();
   bool ok = atomic_compare_exchange_weak_explicit(A32(p), e, v, ACR, ACQ);
@@ -4031,14 +4138,15 @@ INLINE bool a32_cas(DEV u32* p, THR u32* e, u32 v) {
   return ok;
 }
 
-A32_LOOP(exch, v)
-
 INLINE u32 a32_cmpx(DEV u32* p, u32 x, u32 v) {
   u32 o = x;
   while (!a32_cas(p, &o, v) && o == x) {
   }
   return o;
 }
+#endif
+
+A32_LOOP(exch, v)
 
 // Err
 // ===
@@ -4418,7 +4526,7 @@ OUTLINE void span_fade(Env e, Term t, u64 src, u32 n) {
   term_drop(e, t);
 }
 
-INLINE u64 ctr_take(Env e, Term t, u32 n, THR Term* out) {
+INLINE u64 ctr_take(Env e, Term t, u32 n, THR_ARR(Term, out, WL_OUTN)) {
   DEV u64* H = e.mem;
   if (!term_rfc(t)) {
     for (u32 j = 0; j < n; j += 1) {
@@ -4561,7 +4669,8 @@ INLINE Term blk_half(Env e, Term a, u32 hi) {
   return term_blk(arr, c, n);
 }
 
-INLINE Term blk_new(Env e, bool arr, u64 d, u32 lgs, u32 n, THR Term* v) {
+INLINE Term blk_new(Env e, bool arr, u64 d, u32 lgs, u32 n,
+  THR_ARR(Term, v, WL_OUTN)) {
   DEV u64* H = e.mem;
   if (d + lgs > 31) {
     err_post(H, ERR_ARRS);
@@ -4633,7 +4742,8 @@ INLINE u64 task_tail(Term t) {
   return term_loc(t) + fid_arity((u32)term_aux(t));
 }
 
-INLINE Term task_deliver(DEV u64* H, Term cont, u32 idx, THR Term* v, u32 n) {
+INLINE Term task_deliver(DEV u64* H, Term cont, u32 idx,
+  THR_ARR(Term, v, WL_RESW), u32 n) {
   u64 at = cont == TERM_HOLE ? H_ROOT_WORD : term_loc(cont) + idx;
   for (u32 j = 0; j < WL_RESW; j += 1) {
     if (j < n) {
@@ -4701,7 +4811,8 @@ INLINE Term spread_give(Env e, Term cont, Term v) {
 
 // hi holds the high words' places as u32 offsets from H (not pointers: an
 // array of pointers doesn't survive clspv's lowering for Vulkan).
-INLINE void deal_publish(DEV u64* H, THR u64* hi, THR u32* hv, u32 n) {
+INLINE void deal_publish(DEV u64* H, THR_ARR(u64, hi, DEAL_BATCH),
+  THR_ARR(u32, hv, DEAL_BATCH), u32 n) {
   if (n == 0) {
     return;
   }
@@ -4711,7 +4822,7 @@ INLINE void deal_publish(DEV u64* H, THR u64* hi, THR u32* hv, u32 n) {
   }
 }
 
-INLINE void task_deal(DEV u64* H, Term join, u32 base, u32 stride, TG u32* cur) {
+INLINE void task_deal(DEV u64* H, Term join, u32 base, u32 stride, TGP cur) {
   u64 loc = term_loc(join);
   u32 ar  = fid_arity((u32)term_aux(join));
   u32 g   = 0;
@@ -4758,7 +4869,7 @@ INLINE bool root_done(DEV u64* H) {
   return a32_load_acq(a32_at(H, H_ROOT_DONE)) != 0;
 }
 
-static u32 root_take(DEV u64* H, THR Term* v) {
+static u32 root_take(DEV u64* H, THR_ARR(Term, v, WL_RESW)) {
   u32 n = a32_load_acq(a32_at(H, H_ROOT_DONE)) - 1;
   for (u32 j = 0; j < n; j += 1) {
     v[j] = H[H_ROOT_WORD + j];
@@ -4834,7 +4945,7 @@ ${segs}
       STK(0) = lp;
       STK(1) = 0;
       STK(2) = FID_EXIT;
-      sp += 3 * LANE_STEP;
+      SP_MOVE(3 * LANE_STEP);
       seq |= fid_nofk(f) << 1;
       WL_LOAD(term_loc(lp), war)
       r0 = c, r2 = (u32)is, r3 = is >> 32;
@@ -4892,7 +5003,7 @@ ${segs}
     if (err_seen(e.mem)) {
       return 0;
     }
-    sp -= 2 * LANE_STEP;
+    SP_MOVE(-(2 * LANE_STEP));
     Term cont = STK(0);
     u32  idx  = (u32)STK(1);
     if (cont != TERM_HOLE && fid_resw((u32)term_aux(cont))) {
@@ -4946,28 +5057,28 @@ INLINE u64 spread_steps(DEV u64* H, Term t) {
     : H[term_loc(t) + SPRD_C];
 }
 
-INLINE u32 spread_post(DEV u64* H, Term t, TG u32* vote) {
-  u32     k   = a32_add(vote + SPRD_N, 1);
-  u64     loc = term_loc(t);
-  TG u32* p   = vote + SPRD_LIST + SPRD_LW * k;
-  p[0] = (u32)t, p[1] = (u32)(t >> 32);
+INLINE u32 spread_post(DEV u64* H, Term t, TGP vote) {
+  u32 k   = a32_add(vote + SPRD_N, 1);
+  u64 loc = term_loc(t);
+  TGP p   = vote + SPRD_LIST + SPRD_LW * k;
+  TGA(p, 0) = (u32)t, TGA(p, 1) = (u32)(t >> 32);
   if (term_tag(t) == TAG_SPR) {
     u64 is = H[loc + 1];
-    p[2] = (u32)is, p[3] = (u32)H[loc + 2], p[4] = (u32)(is >> 32);
+    TGA(p, 2) = (u32)is, TGA(p, 3) = (u32)H[loc + 2], TGA(p, 4) = (u32)(is >> 32);
   } else {
-    p[2] = (u32)H[loc + SPRD_I], p[3] = (u32)H[loc + SPRD_C];
-    p[4] = (u32)H[loc + SPRD_ST];
+    TGA(p, 2) = (u32)H[loc + SPRD_I], TGA(p, 3) = (u32)H[loc + SPRD_C];
+    TGA(p, 4) = (u32)H[loc + SPRD_ST];
   }
   return k;
 }
 
-INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
+INLINE void spread_split(Env e, TGP vote, u32 lane, u32 rg, u32 posted,
   u32 ran) {
   DEV u64* H    = e.mem;
   u32      m    = CUBE_T / posted;  // lanes a loop
   bool     mine = (ran & 3) == 3;
-  TG u32*  own  = vote + SPRD_LIST + SPRD_LW * (ran >> 2);
-  Term     t    = mine ? own[0] | (u64)own[1] << 32 : 0;
+  TGP      own  = vote + SPRD_LIST + SPRD_LW * (ran >> 2);
+  Term     t    = mine ? TGA(own, 0) | (u64)TGA(own, 1) << 32 : 0;
   if (m < 2) {
     if (mine) {
       ring_push(H, rg, t);
@@ -4982,7 +5093,7 @@ INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
   if (mine) {
     u32 f     = (u32)term_aux(t);
     u32 ar    = fid_arity(f);
-    u32 parts = own[3] < m ? own[3] : m;
+    u32 parts = TGA(own, 3) < m ? TGA(own, 3) : m;
     u64 loc   = term_loc(t);
     if (term_tag(t) == TAG_SPR) {  // a part: a loop of its own now
       Term lp = H[loc];
@@ -4991,7 +5102,7 @@ INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
         H[n + w] = H[term_loc(lp) + w];
       }
       loc = n, t = term_tsk(f, n);
-      own[0] = (u32)t, own[1] = (u32)(t >> 32);
+      TGA(own, 0) = (u32)t, TGA(own, 1) = (u32)(t >> 32);
     }
     H[loc + SPRD_A] = term_keep(e, H[loc + SPRD_A], parts);
     for (u32 w = SPRD_ST + 1; w < ar; w += 1) {
@@ -5000,7 +5111,7 @@ INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
       }
     }
     u64 cells = heap_alloc(e, cls_fit(parts * SPRD_CELL));
-    own[5] = (u32)cells, own[6] = (u32)(cells >> 32);
+    TGA(own, 5) = (u32)cells, TGA(own, 6) = (u32)(cells >> 32);
     H[loc + SPRD_C]  = 0;
     H[loc + SPRD_I]  = 0;
     H[loc + SPRD_ST] = cells | (u64)parts << 48;
@@ -5009,14 +5120,14 @@ INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
   BARD();
   u32 k = lane / m, q = lane % m;
   if (k < posted) {
-    TG u32* p     = vote + SPRD_LIST + SPRD_LW * k;
-    u32     c     = p[3];
+    TGP     p     = vote + SPRD_LIST + SPRD_LW * k;
+    u32     c     = TGA(p, 3);
     u32     parts = c < m ? c : m;
     if (q < parts) {
-      Term pt   = p[0] | (u64)p[1] << 32;
-      u64  cell = (p[5] | (u64)p[6] << 32) + q * SPRD_CELL;
+      Term pt   = TGA(p, 0) | (u64)TGA(p, 1) << 32;
+      u64  cell = (TGA(p, 5) | (u64)TGA(p, 6) << 32) + q * SPRD_CELL;
       H[cell]     = pt;
-      H[cell + 1] = (u32)(p[2] + q * p[4]) | (u64)(u32)(p[4] * parts) << 32;
+      H[cell + 1] = (u32)(TGA(p, 2) + q * TGA(p, 4)) | (u64)(u32)(TGA(p, 4) * parts) << 32;
       H[cell + 2] = (c - q + parts - 1) / parts;
       ring_push(H, rg, term_make(TAG_SPR, term_aux(pt), cell));
     }
@@ -5032,7 +5143,7 @@ INLINE void spread_split(Env e, TG u32* vote, u32 lane, u32 rg, u32 posted,
 // lane skips a fork-free one). The host grows a row ring by
 // ring and drains a ring; a device lane does both.
 INLINE u32 monk_step(Env e, DEV Term* stk, u32 rg, u32 put0, u32 base, u32 stride,
-  TG u32* cur) {
+  TGP cur) {
   DEV u64* H   = e.mem;
   bool     seq = stride == 0;
   DEV u32* get = ring_get(H, rg);
@@ -5145,6 +5256,17 @@ __kernel void bend_dev(ulong heap, u32 pass, u32 grids, TG u32* vote) {
   DEV u64* H = (DEV u64*)heap;
   u32 row   = get_group_id(0);
   u32 lane  = get_local_id(0);
+#elif defined(BEND_SLANG)
+struct BendArgs { u64 heap; u32 pass; u32 grids; };
+[[vk::push_constant]] BendArgs bend_args;
+[numthreads(CUBE_T, 1, 1)]
+void main(uint3 bend_gid : SV_GroupID, uint3 bend_lid : SV_GroupThreadID) {
+  DEV u64* H     = (DEV u64*)bend_args.heap;
+  u32      pass  = bend_args.pass;
+  u32      grids = bend_args.grids;
+  u32      row   = bend_gid.x;
+  u32      lane  = bend_lid.x;
+  TGP      vote  = 0;
 #else
 extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   extern __shared__ u32 vote[];
@@ -5214,7 +5336,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   dev_cut(e);
 }
 
-#if !defined(__METAL_VERSION__) && !defined(BEND_OCL)
+#if !defined(__METAL_VERSION__) && !defined(BEND_OCL) && !defined(BEND_SLANG)
 // Moves whole pages (512 words, a group each) between the corpus and a
 // page-locked stage on the host: in, the stage's pages to list[i]; out, back.
 extern "C" __global__ void bend_pages(DEV u64* H, const u32* list, u32 n,
