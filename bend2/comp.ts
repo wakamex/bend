@@ -6593,8 +6593,10 @@ typedef struct {
 typedef struct {
   VkBuffer       buf;
   VkDeviceMemory mem;
-  u64            at;   // its device address
-  char*          map;  // its host view (host-visible buffers)
+  u64            at;    // its device address
+  char*          map;   // its host view (host-visible buffers)
+  u32            type;  // its memory's type, and size (an app's images can share it)
+  u64            size;
 } GpuBuf;
 
 #define GPU_STAGE   256        // pages a kernel moves
@@ -6752,7 +6754,8 @@ static bool gpu_probe(void) {
   f12.on[8] = 1, f12.on[37] = 1, f12.on[38] = 1, f2.on[40] = 1;
   // Two queues of the family if it has them: an app drawing on the device
   // takes the first (as SDL does), and Bend's submits need not wait for its.
-  u32                     nq      = fams[gpu_family].count > 1 ? 2 : 1;
+  u32                     nq      = fams[gpu_family].count > 1
+    && getenv("BEND_VK_ONE_QUEUE") == NULL ? 2 : 1;
   float                   prio[2] = { 1, 1 };
   VkDeviceQueueCreateInfo qi      = { 2, NULL, 0, gpu_family, nq, prio };
   VkDeviceCreateInfo      dc   = { 3, &f2, 0, 1, &qi, 0, NULL, gpu_ndexts,
@@ -6858,8 +6861,9 @@ static bool gpu_buf_new(GpuBuf* b, u64 bytes, VkFlags want, VkFlags nice) {
     || vkBindBufferMemory(gpu_dev, b->buf, b->mem, 0) != 0) {
     return false;
   }
-  di.buf = b->buf;
-  b->at  = vkGetBufferDeviceAddress(gpu_dev, &di);
+  di.buf  = b->buf;
+  b->at   = vkGetBufferDeviceAddress(gpu_dev, &di);
+  b->type = t, b->size = mr.size;
   return (want & 2) == 0
     || vkMapMemory(gpu_dev, b->mem, 0, bytes, 0, (void**)&b->map) == 0;
 }
