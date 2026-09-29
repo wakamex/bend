@@ -6754,8 +6754,7 @@ static bool gpu_probe(void) {
   f12.on[8] = 1, f12.on[37] = 1, f12.on[38] = 1, f2.on[40] = 1;
   // Two queues of the family if it has them: an app drawing on the device
   // takes the first (as SDL does), and Bend's submits need not wait for its.
-  u32                     nq      = fams[gpu_family].count > 1
-    && getenv("BEND_VK_ONE_QUEUE") == NULL ? 2 : 1;
+  u32                     nq      = fams[gpu_family].count > 1 ? 2 : 1;
   float                   prio[2] = { 1, 1 };
   VkDeviceQueueCreateInfo qi      = { 2, NULL, 0, gpu_family, nq, prio };
   VkDeviceCreateInfo      dc   = { 3, &f2, 0, 1, &qi, 0, NULL, gpu_ndexts,
@@ -6966,6 +6965,19 @@ static int gpu_stamps_take(u32* kind, double* ms, u64* n, int most) {
   return k;
 }
 
+// A submit to Bend's queue, under gpu_qlock (an app sharing the queue can
+// take submits over: see the embedding's bridge).
+static VkResult gpu_submit_locked(const VkSubmitInfo* si) {
+  atomic_fetch_add(&gpu_qwant, 1);
+  pthread_mutex_lock(&gpu_qlock);
+  atomic_fetch_sub(&gpu_qwant, 1);
+  VkResult r = vkQueueSubmit(gpu_queue, 1, si, gpu_fence);
+  pthread_mutex_unlock(&gpu_qlock);
+  return r;
+}
+
+static VkResult (*gpu_submit)(const VkSubmitInfo* si) = gpu_submit_locked;
+
 // Runs the recorded commands and waits for them (their writes then visible
 // to the host).
 static void gpu_flush(void) {
@@ -6985,11 +6997,7 @@ static void gpu_flush(void) {
   vkCmdPipelineBarrier(gpu_cb, 0x10000, 0x4000, 0, 1, &mb, 0, NULL, 0, NULL);
   vkEndCommandBuffer(gpu_cb);
   gpu_rec = false;
-  atomic_fetch_add(&gpu_qwant, 1);
-  pthread_mutex_lock(&gpu_qlock);
-  atomic_fetch_sub(&gpu_qwant, 1);
-  VkResult r = vkQueueSubmit(gpu_queue, 1, &si, gpu_fence);
-  pthread_mutex_unlock(&gpu_qlock);
+  VkResult r = gpu_submit(&si);
   gpu_wait_at = 0;
   if (r != 0 || vkWaitForFences(gpu_dev, 1, &gpu_fence, 1, ~0ull) != 0
     || vkResetFences(gpu_dev, 1, &gpu_fence) != 0) {
