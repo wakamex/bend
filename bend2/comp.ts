@@ -4180,6 +4180,7 @@ typedef u32 __attribute__((may_alias)) u32a;
 #define H_CAP        1
 #define H_CURSOR     LINE
 #define H_ROOT_DONE  (2 * LINE)
+#define H_ROOT_TASK  (H_ROOT_DONE + 1)
 #define H_ERROR_CODE (3 * LINE)
 #define H_ROOT_WORD  (4 * LINE)
 #define H_BANK       (H_ROOT_WORD + WL_RESW)
@@ -5240,10 +5241,12 @@ ${segs}
     } else {
       WL_LOAD(a, war)
     }
-    // A bang's root task (continued by the root) was made by the host, which
-    // frees it after the bang (corpus_eval): on the device it would leave the
-    // host's supply a node short each bang, refilled from the device's.
-    if (!DEVICE || e.mem[a + war] != TERM_HOLE) {
+    // A bang's root task was made by the host, which frees it after the bang
+    // (corpus_eval, which names it in H_ROOT_TASK): on the device it would
+    // leave the host's supply a node short each bang, refilled from the
+    // device's. The join of a fork in it continues the root too, but is the
+    // device's to free.
+    if (!DEVICE || a != e.mem[H_ROOT_TASK]) {
       heap_free(e, cls_fit(war + 2), a);
     }
     WL_DYN(f);
@@ -7404,6 +7407,7 @@ OUTLINE Term corpus_eval(u64* H, Term t) {
         Term cont = H[tl];
         u32  idx  = (u32)(H[tl + 1] >> 32) & 0xFFFF;
         H[tl]     = TERM_HOLE;
+        H[H_ROOT_TASK] = term_loc(t);
         a32_store(a32_at(H, H_CURSOR), 1);
         // Ring 0 is empty between bangs, so it starts from its first slot
         // again: the host then writes one slot, on one page, not the next of
