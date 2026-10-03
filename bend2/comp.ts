@@ -3396,9 +3396,6 @@ const runtime_c = (tabs: string, spins: string, segs: string,
 #if defined(__CUDACC_RTC__)
 #define BEND_RTC 1
 #endif
-#if defined(__OPENCL_C_VERSION__)
-#define BEND_OCL 1  // OpenCL C, for Vulkan through clspv
-#endif
 #if defined(__SLANG__)
 #define BEND_SLANG 1  // Slang, for Vulkan (SPIR-V with buffer device addresses)
 #endif
@@ -3409,7 +3406,7 @@ const runtime_c = (tabs: string, spins: string, segs: string,
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 using namespace metal;
-#elif !defined(BEND_RTC) && !defined(BEND_OCL) && !defined(BEND_SLANG)
+#elif !defined(BEND_RTC) && !defined(BEND_SLANG)
 #ifdef __APPLE__
 #define _DARWIN_UNLIMITED_SELECT
 #else
@@ -3937,20 +3934,6 @@ static bool gpu_load_vk(VkInstance inst) {
 #define BAR()   threadgroup_barrier(mem_flags::mem_threadgroup)
 #define BARD()  threadgroup_barrier(mem_flags::mem_device \
   | mem_flags::mem_threadgroup)
-#elif defined(BEND_OCL)
-#define DEV     __global
-#define THR     __private
-#define TG      __local
-// Everything inlines: clspv can't write a function taking an Env (a struct
-// holding a pointer to global memory).
-#define INLINE  static inline __attribute__((always_inline))
-#define OUTLINE INLINE
-#define CONSTV  __constant
-#define DEVICE  1
-#define CLZ(x)  (u32)clz((uint)(x))
-#define FENCE() mem_fence(CLK_GLOBAL_MEM_FENCE)
-#define BAR()   barrier(CLK_LOCAL_MEM_FENCE)
-#define BARD()  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)
 #elif defined(BEND_SLANG)
 // Slang has pointers to device memory only: the group's memory is one array
 // (bend_vote) that a TGP indexes, and a thread's arrays pass inout.
@@ -3993,9 +3976,7 @@ static bool gpu_load_vk(VkInstance inst) {
 #endif
 #endif
 #undef FAR  // windows.h has its own
-#if defined(BEND_OCL)
-#define FAR INLINE
-#elif defined(BEND_SLANG)
+#if defined(BEND_SLANG)
 #define FAR
 #else
 #define FAR static __attribute__((noinline))
@@ -4064,9 +4045,7 @@ static bool gpu_load_vk(VkInstance inst) {
     STK(wi) = e.mem[A + wi]; \
   } \
   SP_MOVE((N - 1) * LANE_STEP);
-#ifdef BEND_OCL  // (spike) no check: Vulkan can't compare pointers, and LLVM
-#define WL_PAST(a, b) false  // folds integer compares of addresses back into them
-#elif defined(BEND_SLANG)
+#if defined(BEND_SLANG)
 #define WL_PAST(a, b) ((u64)(a) >= (u64)(b))
 #else
 #define WL_PAST(a, b) ((a) >= (b))
@@ -4080,7 +4059,7 @@ static bool gpu_load_vk(VkInstance inst) {
 // Types
 // =====
 
-#if defined(__METAL_VERSION__) || defined(BEND_OCL)
+#if defined(__METAL_VERSION__)
 typedef ulong u64;
 typedef uint  u32;
 typedef uchar u8;
@@ -4101,16 +4080,10 @@ typedef float f32;
 
 typedef u64 Term;
 
-// A lane's heap, and its allocator's words. Under OpenCL (clspv) the words
-// are an offset into the heap: clspv mislowers a struct holding a second
-// pointer to global memory, storing it into the heap.
+// A lane's heap, and its allocator's words.
 typedef struct {
   DEV u64* mem;
-#ifdef BEND_OCL
-  u64      alc;
-#else
   DEV u64* alc;
-#endif
 } Env;
 
 typedef struct {
@@ -4326,23 +4299,6 @@ INLINE bool a32_swp(DEV u32* p, u32* e, u32 v) {
   return *e == x;
 }
 
-#elif defined(BEND_OCL)
-
-// OpenCL's own atomics, which take either address space; the loads and
-// stores keep theirs through __typeof__.
-#define A32(p) (p)
-#define atomic_load_explicit(p, o) (*(volatile __typeof__(*(p))*)(p))
-#define atomic_store_explicit(p, v, o) \
-  (*(volatile __typeof__(*(p))*)(p) = (v))
-${a32_ops((k) => `atomic_fetch_${k}_explicit(p, v, o) atomic_${k}(p, v)`)}
-#define atomic_compare_exchange_weak_explicit(p, e, v, s, f) a32_swp(p, e, v)
-
-INLINE bool a32_swp(DEV u32* p, THR u32* e, u32 v) {
-  u32 x = *e;
-  *e = atomic_cmpxchg((volatile DEV u32*)p, x, v);
-  return *e == x;
-}
-
 #elif defined(BEND_SLANG)
 
 // Device cells by pointer, the group's by index into bend_vote (TGP); every
@@ -4393,7 +4349,7 @@ u32 atomic_fetch_sub_explicit(u32 p, u32 v, int o) { u32 r; InterlockedAdd(bend_
 ${a32_ops((k) => `a32_${k}(p, v) atomic_fetch_${k}_explicit(A32(p), v, RLX)`)}
 #define a32_sub_rel(p, v)   (FENCE(), atomic_fetch_sub_explicit(A32(p), v, REL))
 #define a32_store_rel(p, v) (FENCE(), atomic_store_explicit(A32(p), v, REL))
-#if defined(BEND_OCL) || defined(BEND_SLANG)  // (clspv keeps &H[word]'s type)
+#if defined(BEND_SLANG)  // (clspv keeps &H[word]'s type)
 #define a32_at(H, word)     ((DEV u32*)(H) + 2 * (u64)(word))
 #else
 #define a32_at(H, word)     ((DEV u32*)&(H)[word])
@@ -4536,11 +4492,7 @@ INLINE void bank_push(DEV u64* H, u32 c, u64 head) {
 // class, which a program looping over IO grew into, toward 64 MB a class
 // on 32,768 lanes. The bump grows only when all of these are empty.
 
-#ifdef BEND_OCL
-#define ALC_AT(e, i)   (e).mem[(e).alc + (u64)(i) * LANE_STEP]
-#else
 #define ALC_AT(e, i)   (e).alc[(i) * LANE_STEP]
-#endif
 #define ALC_LEN(e, c)  ALC_AT(e, NCLS_ALL + (c))
 // The words in a node of class c (below 32). A 32-bit shift: clspv writes
 // the 128-bit shift LLVM makes of a 64-bit one as an invalid constant.
@@ -5586,15 +5538,6 @@ kernel void bend_dev(DEV u64* H [[buffer(0)]], constant u32& pass [[buffer(1)]],
   u32 grids [[threadgroups_per_grid]],
   u32 row [[threadgroup_position_in_grid]],
   u32 lane [[thread_position_in_threadgroup]]) {
-#elif defined(BEND_OCL)
-// The heap's address comes as an integer and the arguments in a uniform
-// buffer, so the one push constant block is clspv's for the module's
-// constants (Vulkan allows an entry point one). grids is passed, as clspv's
-// get_num_groups would take another push constant.
-__kernel void bend_dev(ulong heap, u32 pass, u32 grids, TG u32* vote) {
-  DEV u64* H = (DEV u64*)heap;
-  u32 row   = get_group_id(0);
-  u32 lane  = get_local_id(0);
 #elif defined(BEND_SLANG)
 // Both entries' arguments (GpuArgs on the host).
 struct BendArgs {
@@ -5630,11 +5573,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   u32  stride = grids == 1 ? CUBE_G : 1;
   u32  me     = row * CUBE_T + stride * lane;
   u32 rg     = pass ? ring_flip(me) : me;
-#ifdef BEND_OCL
-  Env  e      = { H, ALC_OFF + me };
-#else
   Env  e      = { H, H + ALC_OFF + me };
-#endif
   DEV Term*  stk    = (DEV Term*)(H + STAK_OFF + me);
   if (lane == 0) {
     for (u32 i = 0; i < 5; i += 1) {
@@ -5685,7 +5624,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   dev_cut(e);
 }
 
-#if !defined(__METAL_VERSION__) && !defined(BEND_OCL) && !defined(BEND_SLANG)
+#if !defined(__METAL_VERSION__) && !defined(BEND_SLANG)
 // Moves whole pages (512 words, a group each) between the corpus and a
 // page-locked stage on the host: in, the stage's pages to list[i]; out, back.
 extern "C" __global__ void bend_pages(DEV u64* H, const u32* list, u32 n,
