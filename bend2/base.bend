@@ -480,7 +480,7 @@ def Bool.full_add(a: Bool, b: Bool, c: Bool) -> Bool & Bool:
     case True{} True{} True{}:
       (True{}, True{})
 
-def Bool.pick(-A: Type, c: Bool, a: A, b: A) -> A:
+def Bool.pick(~A: Type, c: Bool, a: A, b: A) -> A:
   match c:
     case False{}:
       b
